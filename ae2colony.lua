@@ -13,9 +13,14 @@
 --       * Mehrere Monitore (jeder mit eigenem Reiter), Terminal per Tastatur bedienbar
 -- v0.9: * Update-System: Programm "update" laedt die neue Version von GitHub
 --       * Automatische Pruefung auf neue Versionen (Hinweis auf Startseite + Chat)
+-- v0.10: * Neuer Reiter "Crafts": laufende Crafts mit Fortschritt, CPU-Auslastung, haengende Crafts
+--        * Vorab-Crafting: Baumaterial nur mit freien CPUs, Reserve fuer Buerger-Anfragen
+--        * Besucher anwerben: Kosten per Antippen in eine Kiste legen, Chat-Hinweis
+--        * Verlaufsdiagramme (24h): Lieferungen, ME-Speicher, Zufriedenheit
+--        * Neuer Reiter "Optionen": Einstellungen per Touch umschalten
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.9.0-ATM10"
+local scriptVersion = "0.10.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 
@@ -57,6 +62,11 @@ return {
   prestockCraft = true,       -- fehlendes Baumaterial automatisch craften
   prestockMaxCraft = 512,     -- maximale Menge pro Craft-Auftrag fuer Baumaterial
   prestockCooldown = 600,     -- Sekunden, bevor fuer dieselbe Baustelle/Item nachgeliefert wird
+  -- Vorab-Crafting: fehlendes Baumaterial aller angenommenen Bauauftraege wird gecraftet,
+  -- aber nur, solange genug Crafting-CPUs frei sind (Buerger-Anfragen haben Vorrang).
+  craftReserveCpus = 1,       -- so viele CPUs bleiben fuer Buerger-Anfragen frei
+  prestockMaxCraftsPerScan = 3, -- hoechstens so viele neue Baumaterial-Crafts pro Scan
+  craftStuckMinutes = 15,     -- Crafts, die laenger laufen, gelten als "haengend" (0 = aus)
 
   -- ===== Anzeige =====
   showColonyStatus = true,
@@ -86,6 +96,8 @@ return {
   chatOnStorage = true,         -- ME-Speicher fast voll / Energie niedrig
   chatOnOldRequest = true,      -- Anfrage haengt laenger als oldRequestMinutes
   chatOnDisease = true,         -- Buerger ist krank geworden
+  chatOnStuckCraft = true,      -- Craft haengt / konnte nicht starten
+  chatOnVisitor = true,         -- neuer Besucher, dessen Anwerbekosten im ME liegen
 
   -- ===== Dateien & Statistik =====
   trackMissingPatterns = true,
@@ -94,6 +106,15 @@ return {
   statsFile = "ae2colony_stats.db",
   statsShowTop = 10,
   buildsFile = "ae2colony_builds.db",
+  historyFile = "ae2colony_history.db",
+
+  -- ===== Besucher =====
+  -- Kiste fuer Anwerbekosten (wie exportSide, z.B. "@top"). "" = Funktion aus.
+  -- Im Reiter "Kolonie" einen Besucher zweimal antippen -> Kosten werden in diese Kiste gelegt.
+  recruitSide = "",
+
+  -- ===== Optionen-Reiter =====
+  lockSettings = false,       -- true = Optionen nur am Computer-Terminal aenderbar, nicht am Monitor
 
   -- ===== Updates =====
   updateCheckHours = 6,       -- alle X Stunden nach neuer Version suchen (0 = aus)
@@ -240,6 +261,7 @@ local function newState()
     requests = {}, builds = {}, citizens = {}, citizenCount = 0,
     buildingsWorking = {}, buildingsUpgrade = {}, visitors = {},
     alerts = {}, errors = {}, colony = {}, me = {}, online = false, meStatus = "...",
+    cpus = nil, freeCpus = nil, cpuJobs = nil,
   }
 end
 S = newState()
@@ -249,6 +271,7 @@ local function addAlert(msg) logLine("[ALARM] "..msg); S.alerts[#S.alerts+1] = a
 local missingDb  = cfg.trackMissingPatterns and loadDb(cfg.missingPatternFile) or {}
 local statsDb    = loadDb(cfg.statsFile)
 local buildDb    = loadDb(cfg.buildsFile)
+local historyDb  = loadDb(cfg.historyFile)
 local missingCounted, missingNotified = {}, {}
 local sentAt     = {}   -- request id -> Zeitpunkt der letzten Lieferung
 local firstSeen  = {}   -- request id -> Zeitpunkt, an dem die Anfrage zuerst gesehen wurde
@@ -302,14 +325,34 @@ local function statsToday()
   statsDb.items = statsDb.items or {}
   return statsDb
 end
+-- Verlauf: ein Eintrag pro Stunde (Ortszeit), die letzten 48 Stunden
+local function hourKey() return math.floor(os.epoch("local") / 3600000) end
+local function histBucket()
+  local k = hourKey()
+  historyDb.h = historyDb.h or {}
+  local b = historyDb.h[k]
+  if not b then
+    b = {sent=0, crafts=0}
+    historyDb.h[k] = b
+    for old in pairs(historyDb.h) do if old < k - 47 then historyDb.h[old] = nil end end
+  end
+  return b
+end
+local function histSample(field, v)
+  if type(v) ~= "number" then return end
+  local b = histBucket()
+  b[field] = v
+end
+
 local function statDelivered(name, label, n)
   local s = statsToday()
+  local hb = histBucket(); hb.sent = hb.sent + n
   s.sent = s.sent + n
   local e = s.items[name] or {n=0}
   e.n = e.n + n; e.label = label or e.label
   s.items[name] = e
 end
-local function statCraft() local s = statsToday(); s.crafts = s.crafts + 1 end
+local function statCraft() local s = statsToday(); s.crafts = s.crafts + 1; local hb = histBucket(); hb.crafts = hb.crafts + 1 end
 
 local function recordMissing(name, display, countKey, silent)
   if cfg.trackMissingPatterns and not missingCounted[countKey] then
@@ -439,18 +482,29 @@ local function readCitizens(c)
   table.sort(S.citizens, function(a, b) if a.severity ~= b.severity then return a.severity > b.severity end return a.name < b.name end)
 end
 
+local visitorNotified = {}
 local function readVisitors(c, byName)
   local list = call(c, "getVisitors")
   if type(list) ~= "table" then return end
+  local present = {}
   for _, v in ipairs(list) do
     local cost = v.recruitCost
     local have = 0
     if cost and cost.name and byName then
       for _, s in ipairs(byName[cost.name] or {}) do have = have + (tonumber(s.count) or 0) end
     end
-    S.visitors[#S.visitors+1] = {name=asc(v.name), costName=cost and itemLabel(cost) or "?",
-      costCount=cost and tonumber(cost.count) or 0, have=have}
+    local e = {name=asc(v.name), costName=cost and itemLabel(cost) or "?",
+      costCount=cost and tonumber(cost.count) or 0, have=have,
+      costItem=cost and cost.name, costHash=cost and itemHash(cost)}
+    e.enough = byName ~= nil and e.costCount > 0 and have >= e.costCount
+    S.visitors[#S.visitors+1] = e
+    present[e.name] = true
+    if e.enough and cfg.chatOnVisitor and not visitorNotified[e.name] then
+      visitorNotified[e.name] = true
+      chat("Besucher "..e.name.." kann angeworben werden ("..e.costCount.."x "..e.costName.." im ME)")
+    end
   end
+  for name in pairs(visitorNotified) do if not present[name] then visitorNotified[name] = nil end end
 end
 
 local function readME(b)
@@ -490,6 +544,82 @@ local function findBridgeItem(byName, name, hash)
   return nil
 end
 local function takeStock(found, n) found.count = (tonumber(found.count) or 0) - n end
+local function stockOf(byName, name)
+  local n = 0
+  for _, v in ipairs(byName and byName[name] or {}) do n = n + (tonumber(v.count) or 0) end
+  return n
+end
+
+-- Crafting-CPUs: Auslastung + was gerade gecraftet wird
+local function readCpus(b)
+  local cpus = call(b, "getCraftingCPUs")
+  if type(cpus) ~= "table" then return end
+  local pctBy = {}
+  local tasks = call(b, "getCraftingTasks")
+  if type(tasks) == "table" then
+    for _, tk in ipairs(tasks) do
+      local r = type(tk) == "table" and tk.resource
+      if type(r) == "table" and r.name and tonumber(tk.completion) then pctBy[r.name] = math.floor(tk.completion * 100) end
+    end
+  end
+  local list, free, jobs = {}, 0, {}
+  for i, cpu in ipairs(cpus) do
+    local name = (type(cpu.name) == "string" and cpu.name ~= "" and cpu.name ~= "Unnamed") and asc(cpu.name) or ("CPU "..i)
+    local job = type(cpu.craftingJob) == "table" and cpu.craftingJob or nil
+    local res = job and type(job.resource) == "table" and job.resource or nil
+    local e = {name=name, busy=cpu.isBusy == true, item=res and res.name, label=res and itemLabel(res),
+      qty=job and tonumber(job.quantity), storage=tonumber(cpu.storage), co=tonumber(cpu.coProcessors)}
+    if not e.busy then free = free + 1 end
+    if e.busy and e.item then e.pct = pctBy[e.item]; jobs[e.item] = e end
+    list[#list+1] = e
+  end
+  S.cpus, S.freeCpus, S.cpuJobs = list, free, jobs
+end
+
+-- Vom Skript gestartete Crafts verfolgen
+local crafts, craftSeq = {}, 0
+local craftFailedAt = {}   -- item -> Zeitpunkt des letzten nicht gestarteten Crafts
+local function trackCraft(name, hash, count, info)
+  craftSeq = craftSeq + 1
+  crafts[#crafts+1] = {id=craftSeq, name=name, hash=hash, count=count, t=now(), state="START",
+    label=info.label or shortName(name), source=info.source or "", stock=info.stock or 0}
+end
+local function updateCrafts(byName)
+  local t, keep = now(), {}
+  for _, c in ipairs(crafts) do
+    local job = S.cpuJobs and S.cpuJobs[c.name]
+    if c.state == "START" or c.state == "LAEUFT" then
+      if job then
+        c.seen, c.state, c.pct, c.cpu = true, "LAEUFT", job.pct, job.name
+        job.tracked = true
+        if cfg.craftStuckMinutes > 0 and t - c.t >= cfg.craftStuckMinutes * 60000 then
+          c.stuck = true
+          if cfg.chatOnStuckCraft then alert("craft:"..c.id, true, "Craft haengt seit "..fmtAge(t - c.t)..": "..c.label) end
+        end
+      elseif c.seen or (byName and stockOf(byName, c.name) > c.stock) then
+        c.state, c.doneAt, c.stuck = "FERTIG", t, nil
+      elseif S.cpuJobs and t - c.t > 90000 then
+        c.state, c.doneAt = "FEHLER", t
+        c.note = "nicht gestartet - Zutaten fehlen?"
+        local last = craftFailedAt[c.name]
+        if cfg.chatOnStuckCraft and not (last and t - last < 1800000) then
+          chat("Craft nicht gestartet (Zutaten fehlen?): "..c.count.."x "..c.label)
+        end
+        craftFailedAt[c.name] = t
+      end
+    end
+    local ttl = c.state == "FERTIG" and 600000 or 1800000
+    if not c.doneAt or t - c.doneAt < ttl then keep[#keep+1] = c else alertActive["craft:"..c.id] = nil end
+  end
+  crafts = keep
+  local stuck, failed = 0, 0
+  for _, c in ipairs(crafts) do
+    if c.stuck and c.state == "LAEUFT" then stuck = stuck + 1 end
+    if c.state == "FEHLER" then failed = failed + 1 end
+  end
+  if stuck > 0 then addAlert(stuck.." Craft(s) laufen laenger als "..cfg.craftStuckMinutes.." min") end
+  if failed > 0 then addAlert(failed.." Craft(s) nicht gestartet - siehe Reiter Crafts") end
+end
 
 local function deliveryKey(pos, name, hash) return pos.."|"..name.."|"..tostring(hash) end
 local function recentDelivery(key, cooldown)
@@ -528,8 +658,10 @@ local function processExportBuffer(b)
   end
 end
 
--- Rueckgabe: "started", "running", "nopattern" oder "error"
-local function tryCraft(b, name, hash, count, quiet)
+-- Rueckgabe: "started", "running", "nopattern", "nocpu", "limit", "failed" oder "error"
+-- info = {label, source, stock, reserve (CPUs, die frei bleiben muessen), noStart}
+local function tryCraft(b, name, hash, count, quiet, info)
+  info = info or {}
   if cfg.craftMaxStack then count = math.max(count, 64) end
   if count <= 0 then count = 1 end
   local filter = {name=name, count=count}; if hash then filter.nbtHash = hash end
@@ -542,8 +674,16 @@ local function tryCraft(b, name, hash, count, quiet)
     return "error"
   end
   if not craftable then return "nopattern" end
+  if craftFailedAt[name] and now() - craftFailedAt[name] < 300000 then return "failed" end
+  if info.noStart then return "limit" end
+  if S.freeCpus and S.freeCpus <= (info.reserve or 0) then return "nocpu" end
   local ok2, job, err2 = pcall(b.craftItem, filter)
-  if ok2 and job then clearMissing(name); statCraft(); return "started" end
+  if ok2 and job then
+    clearMissing(name); statCraft()
+    if S.freeCpus then S.freeCpus = S.freeCpus - 1 end
+    trackCraft(name, hash, count, info)
+    return "started"
+  end
   addError("Craft abgelehnt "..shortName(name)..": "..tostring(ok2 and err2 or job))
   return "error"
 end
@@ -666,9 +806,12 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   local anyError = false
   for i, c in ipairs(candidates) do
     if i > cfg.maxCraftCandidates then break end
-    local r = tryCraft(b, c.name, c.hash, remaining, i > 1)
+    local r = tryCraft(b, c.name, c.hash, remaining, i > 1,
+      {label=entry.label, source=entry.target, stock=stockOf(byName, c.name)})
     if r == "started" then entry.state = "CRAFT"; entry.note = prefix.."x"..remaining.." beauftragt"; return end
     if r == "running" then entry.state = "LAEUFT"; entry.note = prefix.."Crafting laeuft"; return end
+    if r == "nocpu" then entry.state = "WARTET"; entry.note = prefix.."alle Crafting-CPUs belegt"; return end
+    if r == "failed" then entry.state = "FEHLT"; entry.note = prefix.."Craft startet nicht - Zutaten?"; return end
     if r == "error" then anyError = true end
   end
   if not anyError then recordMissing(candidates[1].name, entry.label, "req:"..tostring(req.id)) end
@@ -774,6 +917,7 @@ local function handleBuilds(b, c, byName)
   local orders = call(c, "getWorkOrders")
   if type(orders) ~= "table" then return end
   local active = {}
+  local started = 0
   for _, wo in ipairs(orders) do
     active[tostring(wo.id)] = true
     local entry = {
@@ -808,28 +952,39 @@ local function handleBuilds(b, c, byName)
               entry.res[#entry.res+1] = row
               local found = findBridgeItem(byName, it.name, hash)
               local stock = found and (tonumber(found.count) or 0) or 0
-              if not cfg.prestockEnabled then
-                row.note = stock > 0 and ("im ME: "..stock) or ""
-              else
-                local send = math.min(need, stock)
+              local send = 0
+              if cfg.prestockEnabled then
+                send = math.min(need, stock)
                 if send > 0 then
                   takeStock(found, send)
                   queueExport({name=it.name, hash=hash, count=send, side=cfg.prestockSide,
                     label=row.label, key=key, cooldown=cfg.prestockCooldown, entry=row})
                   row.state = "OK"; row.note = "x"..send.." geliefert"
                 end
-                local rest = need - send
-                if rest > 0 then
-                  local r2 = cfg.prestockCraft and tryCraft(b, it.name, hash, math.min(rest, cfg.prestockMaxCraft), true) or "off"
-                  if r2 == "started" then row.state = "CRAFT"; row.note = "x"..math.min(rest, cfg.prestockMaxCraft).." beauftragt"
-                  elseif r2 == "running" then row.state = "LAEUFT"; row.note = "Crafting laeuft"
-                  else
-                    row.state = "FEHLT"; entry.missing = entry.missing + 1
-                    row.note = (send > 0 and ("x"..send.." geliefert, ") or "")..(r2 == "nopattern" and "kein Pattern" or "fehlt")
-                    if r2 == "nopattern" then
-                      noPattern = noPattern + 1
-                      recordMissing(it.name, row.label, "build:"..key, true)
-                    end
+              end
+              -- ohne Vorlieferung zaehlt der ME-Bestand als "bereit"
+              local rest = need - send - (cfg.prestockEnabled and 0 or stock)
+              local pre = send > 0 and ("x"..send.." geliefert, ") or ""
+              if rest <= 0 then
+                if not cfg.prestockEnabled then row.state = "OK"; row.note = "im ME: "..stock end
+              elseif not cfg.prestockCraft then
+                row.state = "FEHLT"; entry.missing = entry.missing + 1
+                row.note = pre..(stock > 0 and not cfg.prestockEnabled and ("im ME: "..stock) or "fehlt")
+              else
+                local amount = math.min(rest, cfg.prestockMaxCraft)
+                local r2 = tryCraft(b, it.name, hash, amount, true, {label=row.label, source="Bau: "..entry.name,
+                  stock=stockOf(byName, it.name), reserve=cfg.craftReserveCpus,
+                  noStart=started >= cfg.prestockMaxCraftsPerScan})
+                if r2 == "started" then started = started + 1; row.state = "CRAFT"; row.note = pre.."x"..amount.." beauftragt"
+                elseif r2 == "running" then row.state = "LAEUFT"; row.note = pre.."Crafting laeuft"
+                elseif r2 == "nocpu" then row.state = "OFFEN"; row.note = pre.."wartet auf freie CPU"
+                elseif r2 == "limit" then row.state = "OFFEN"; row.note = pre.."wird gecraftet (naechster Scan)"
+                else
+                  row.state = "FEHLT"; entry.missing = entry.missing + 1
+                  row.note = pre..(r2 == "nopattern" and "kein Pattern" or (r2 == "failed" and "Craft startet nicht - Zutaten?" or "fehlt"))
+                  if r2 == "nopattern" then
+                    noPattern = noPattern + 1
+                    recordMissing(it.name, row.label, "build:"..key, true)
                   end
                 end
               end
@@ -899,6 +1054,7 @@ local function scan()
   S = newState()
   findChatBox()
   readColony(colony)
+  histSample("happy", S.colony.happy)
   readBuildings(colony)
   readCitizens(colony)
   local online, status = bridgeStatus(bridge)
@@ -906,25 +1062,32 @@ local function scan()
   if cfg.chatOnOffline then alert("offline", not online, "ME-Netz nicht erreichbar: "..status) end
   if not online then addAlert("ME Bridge: "..status); readVisitors(colony, nil); return end
   readME(bridge)
+  histSample("storage", S.me.storagePct)
   local byName = readBridgeItems(bridge)
+  readCpus(bridge)
+  updateCrafts(byName)
   readVisitors(colony, byName)
   if not byName then return end
   handleRequests(bridge, colony, byName)   -- Requests zuerst (Buerger warten bereits)
   handleBuilds(bridge, colony, byName)     -- danach Baumaterial mit dem restlichen Bestand
   processExportBuffer(bridge)
   saveDb(cfg.statsFile, statsToday())
+  saveDb(cfg.historyFile, historyDb)
 end
 
 -- =====================================================================
 -- UI
 -- =====================================================================
 local TABS = {
-  {id="start", label="Start"}, {id="anfragen", label="Anfragen"}, {id="bau", label="Bau"},
-  {id="buerger", label="Buerger"}, {id="kolonie", label="Kolonie"}, {id="stats", label="Stats"},
+  {id="start", label="Start", short="Start"}, {id="anfragen", label="Anfragen", short="Anfr"},
+  {id="bau", label="Bau", short="Bau"}, {id="crafts", label="Crafts", short="Craft"},
+  {id="buerger", label="Buerger", short="Buer"}, {id="kolonie", label="Kolonie", short="Kol"},
+  {id="stats", label="Stats", short="Stat"}, {id="optionen", label="Optionen", short="Opt"},
 }
 local stateStyle = {
   FEHLER={colors.red, "FEHLER"}, FEHLT={colors.orange, "FEHLT"}, MANUELL={colors.cyan, "MANUELL"},
   CRAFT={colors.green, "CRAFT"}, LAEUFT={colors.green, "LAEUFT"}, OK={colors.lime, "OK"},
+  START={colors.lightBlue, "START"}, FERTIG={colors.lime, "FERTIG"}, HAENGT={colors.red, "HAENGT"},
   WARTET={colors.lightBlue, "WARTET"}, SKIP={colors.gray, "SKIP"}, OFFEN={colors.lightGray, "OFFEN"},
 }
 local stateRank = {FEHLER=1, FEHLT=2, MANUELL=3, CRAFT=4, LAEUFT=5, OFFEN=6, OK=7, WARTET=8, SKIP=9}
@@ -1004,6 +1167,26 @@ local function todayLine()
   for _, e in ipairs(S.requests) do if e.state == "FEHLT" or e.state == "FEHLER" then missing = missing + 1 end end
   return {seg(fit("Heute", 9), colors.lightGray), seg(s.sent.." geliefert  ", colors.lime),
     seg(s.crafts.." Crafts  ", colors.green), seg(missing.." Probleme", missing > 0 and colors.orange or colors.lightGray)}
+end
+
+-- Besucher anwerben: Kosten in eine Kiste legen (zweimal tippen)
+local recruitArm, recruitMsg = nil, nil
+local function recruitTap(v)
+  if recruitArm and recruitArm.name == v.name and now() < recruitArm.untilT then
+    recruitArm = nil
+    local filter = {name=v.costItem, count=v.costCount, nbtHash=v.costHash or ""}
+    local ok, moved, err = pcall(bridge.exportItem, cfg.recruitSide, filter)
+    if ok and type(moved) == "number" and moved > 0 then
+      recruitMsg = {t=now(), color=colors.lime, text=moved.."x "..v.costName.." fuer "..v.name.." in die Kiste gelegt"}
+      logLine("[RECRUIT] "..v.name.." "..moved.."x "..tostring(v.costItem))
+    else
+      local reason = (not ok) and tostring(moved) or tostring(err or "Kiste voll?")
+      if reason == "INVENTORY_NOT_FOUND" then reason = "keine Kiste bei "..cfg.recruitSide end
+      recruitMsg = {t=now(), color=colors.red, text="Ausgabe fehlgeschlagen: "..reason}
+    end
+  else
+    recruitArm = {name=v.name, untilT=now() + 8000}
+  end
 end
 
 local renderers = {}
@@ -1132,18 +1315,142 @@ function renderers.kolonie(w)
   end
   rows[#rows+1] = heading("Besucher in der Taverne ("..#S.visitors..")", w)
   if #S.visitors == 0 then rows[#rows+1] = textRow("  keine", colors.gray) end
+  local canRecruit = cfg.recruitSide ~= ""
+  if #S.visitors > 0 then
+    rows[#rows+1] = textRow(fit(canRecruit and "  Gruen = bezahlbar, 2x tippen = Kosten in Kiste"
+      or "  Gruen = bezahlbar (Ausgabe: recruitSide setzen)", w), colors.gray)
+  end
+  if #S.visitors > 0 then
+    if recruitMsg and now() - recruitMsg.t < 15000 then rows[#rows+1] = textRow(fit("  "..recruitMsg.text, w), recruitMsg.color)
+    else rows[#rows+1] = blank() end
+  end
   for _, v in ipairs(S.visitors) do
-    local enough = v.have >= v.costCount and v.costCount > 0
     local wName = math.min(18, math.floor(w*0.35))
-    rows[#rows+1] = {seg(fit("  "..v.name, wName)), seg(fit(v.costCount.."x "..v.costName, w-wName-12)),
-      seg(fit("ME: "..v.have, 12, true), enough and colors.lime or colors.orange)}
+    local armed = recruitArm and recruitArm.name == v.name and now() < recruitArm.untilT
+    local row = {seg(fit("  "..v.name, wName), v.enough and colors.lime or colors.white),
+      seg(fit(armed and "Nochmal tippen!" or (v.costCount.."x "..v.costName), w-wName-12), armed and colors.yellow or colors.white),
+      seg(fit("ME: "..v.have, 12, true), v.enough and colors.lime or colors.orange)}
+    if canRecruit and v.enough then row.action = function() recruitTap(v) end end
+    rows[#rows+1] = row
   end
   return rows
 end
+
+function renderers.crafts(w)
+  local rows = {}
+  if S.cpus then
+    local busy = #S.cpus - (S.freeCpus or 0)
+    local free = 0; for _, c in ipairs(S.cpus) do if not c.busy then free = free + 1 end end
+    rows[#rows+1] = {seg(fit("CPUs", 9), colors.lightGray), seg(free.." von "..#S.cpus.." frei", free > cfg.craftReserveCpus and colors.lime or colors.orange),
+      seg("   Reserve fuer Anfragen: "..cfg.craftReserveCpus, colors.gray)}
+    local wBar = math.max(4, math.min(#S.cpus, w - 10))
+    if #S.cpus > 0 and wBar >= #S.cpus then
+      local r = {seg(fit("", 9))}
+      for _, c in ipairs(S.cpus) do r[#r+1] = seg(" ", colors.white, c.busy and colors.orange or colors.green, c.busy and "#" or ".") end
+      rows[#rows+1] = r
+    end
+  else
+    rows[#rows+1] = textRow("CPU-Daten nicht verfuegbar", colors.gray)
+  end
+  local t = now()
+  local running, done = {}, {}
+  for _, c in ipairs(crafts) do
+    if c.state == "START" or c.state == "LAEUFT" then running[#running+1] = c else done[#done+1] = c end
+  end
+  local wNote = w >= 60 and math.floor(w*0.35) or (w >= 45 and 14 or 0)
+  local function craftRow(c)
+    local state = c.stuck and c.state == "LAEUFT" and "HAENGT" or c.state
+    local st = stateStyle[state] or {colors.white, state}
+    local info
+    if state == "LAEUFT" or state == "HAENGT" or state == "START" then
+      info = (c.pct and (c.pct.."% ") or "")..fmtAge(t - c.t)..(c.cpu and (" "..c.cpu) or "")
+    elseif state == "FEHLER" then info = c.note or "fehlgeschlagen"
+    else info = "vor "..fmtAge(t - (c.doneAt or t)) end
+    local row = {seg(fit(st[2], 8), st[1]), seg(fit(tostring(c.count), 5, true).." ", colors.lightGray),
+      seg(fit(c.label, w - 14 - wNote))}
+    if wNote > 0 then row[#row+1] = seg(fit(" "..info, wNote), state == "HAENGT" and colors.red or colors.lightGray) end
+    return row
+  end
+  rows[#rows+1] = heading("Vom Skript gestartet ("..#running..")", w)
+  if #running == 0 then rows[#rows+1] = textRow("  keine laufenden Crafts", colors.gray) end
+  for _, c in ipairs(running) do
+    rows[#rows+1] = craftRow(c)
+    if c.source ~= "" and w >= 30 then rows[#rows+1] = textRow(fit("         fuer "..c.source, w), colors.gray) end
+  end
+  local others = {}
+  for _, c in ipairs(S.cpus or {}) do if c.busy and not (S.cpuJobs[c.item or ""] or {}).tracked then others[#others+1] = c end end
+  if #others > 0 then
+    rows[#rows+1] = heading("Andere Crafts im ME ("..#others..")", w)
+    for _, c in ipairs(others) do
+      rows[#rows+1] = {seg(fit("LAEUFT", 8), colors.green), seg(fit(tostring(c.qty or "?"), 5, true).." ", colors.lightGray),
+        seg(fit(c.label or "?", w - 14 - wNote)), seg(fit(wNote > 0 and (" "..(c.pct and (c.pct.."% ") or "")..c.name) or "", wNote), colors.lightGray)}
+    end
+  end
+  if #done > 0 then
+    rows[#rows+1] = heading("Zuletzt beendet", w)
+    table.sort(done, function(a, b) return (a.doneAt or 0) > (b.doneAt or 0) end)
+    for _, c in ipairs(done) do rows[#rows+1] = craftRow(c) end
+  end
+  return rows
+end
+
+-- Balkendiagramm der letzten Stunden. get(bucket) liefert den Wert oder nil.
+local function chartRows(title, w, get, opts)
+  local rows = {}
+  local height = opts.height or 5
+  local labelW = 5
+  local avail = w - labelW - 1
+  local bw = avail >= 48 and 2 or 1
+  local n = math.min(24, math.floor(avail / bw))
+  local k0 = hourKey() - n + 1
+  local vals, maxV = {}, opts.max or 0
+  for i = 1, n do
+    local b = historyDb.h and historyDb.h[k0 + i - 1]
+    local v = b and get(b)
+    vals[i] = v
+    if not opts.max and v and v > maxV then maxV = v end
+  end
+  if maxV <= 0 then maxV = 1 end
+  rows[#rows+1] = heading(title, w)
+  local function fmtV(v) if v >= 10000 then return math.floor(v/1000).."k" end return tostring(math.floor(v + 0.5)) end
+  for r = height, 1, -1 do
+    local yl = r == height and fmtV(maxV) or (r == 1 and "0" or "")
+    local row = {seg(fit(yl, labelW, true).." ", colors.gray)}
+    local threshold = maxV * (r - 0.5) / height
+    for i = 1, n do
+      local v = vals[i]
+      local filled = v and v >= threshold and v > 0
+      local color = filled and (opts.color and opts.color(v) or colors.green) or nil
+      row[#row+1] = seg(string.rep(filled and " " or (r == 1 and (v and "_" or ".") or " "), bw),
+        colors.gray, color, filled and "#" or nil)
+    end
+    rows[#rows+1] = row
+  end
+  -- Zeitachse: alle 6 Stunden eine Beschriftung
+  local axis = string.rep(" ", labelW + 1)
+  local txt = string.rep(" ", n * bw)
+  for i = 1, n do
+    local hour = (k0 + i - 1) % 24   -- Schluessel = Stunden seit 1970 in Ortszeit
+    if hour % 6 == 0 then
+      local pos = (i - 1) * bw + 1
+      local label = string.format("%02d", hour)
+      if pos + 1 <= #txt then txt = txt:sub(1, pos - 1)..label..txt:sub(pos + 2) end
+    end
+  end
+  rows[#rows+1] = {seg(axis..txt, colors.gray)}
+  return rows
+end
+
 function renderers.stats(w)
   local rows = {}
   local s = statsToday()
   rows[#rows+1] = {seg("Heute ("..s.day.."): ", colors.lightGray), seg(s.sent.." geliefert, ", colors.lime), seg(s.crafts.." Crafts", colors.green)}
+  local function add(list) for _, r in ipairs(list) do rows[#rows+1] = r end end
+  add(chartRows("Geliefert pro Stunde (24h)", w, function(b) return b.sent end, {height=5}))
+  add(chartRows("ME-Speicher % (24h)", w, function(b) return b.storage end, {height=4, max=100,
+    color=function(v) return (cfg.storageWarnPercent > 0 and v >= cfg.storageWarnPercent) and colors.red or colors.cyan end}))
+  add(chartRows("Zufriedenheit (24h)", w, function(b) return b.happy end, {height=4, max=10,
+    color=function(v) return v < cfg.chatHappinessBelow and colors.orange or colors.lime end}))
   rows[#rows+1] = heading("Meistgeliefert (gesamt)", w)
   local items = {}
   for name, e in pairs(s.items or {}) do items[#items+1] = {name=name, n=e.n, label=e.label} end
@@ -1161,6 +1468,93 @@ function renderers.stats(w)
     for i = 1, math.min(cfg.missingPatternShowTop, #list) do
       rows[#rows+1] = {seg(fit(list[i].e.count.."x", 8, true).."  ", colors.pink),
         seg(fit(asc(list[i].e.display or shortName(list[i].name)), w-10))}
+    end
+  end
+  return rows
+end
+
+-- ---------- Optionen ----------
+local SETTINGS = {
+  {head="Lieferung & Crafting"},
+  {key="prestockEnabled", label="Baumaterial vorliefern"},
+  {key="prestockCraft", label="Baumaterial vorab craften"},
+  {key="craftReserveCpus", label="CPUs fuer Anfragen reservieren", choices={0, 1, 2, 3, 4}},
+  {key="prestockMaxCraftsPerScan", label="Baumaterial-Crafts pro Scan", choices={1, 2, 3, 5, 10}},
+  {key="craftMaxStack", label="Immer mind. 64 craften"},
+  {key="maxToolTier", label="Werkzeuge bis Stufe", choices={"wood", "stone", "iron", "diamond", "netherite"}},
+  {key="maxArmorTier", label="Ruestung bis Stufe", choices={"leather", "gold", "chain", "iron", "diamond", "netherite"}},
+  {key="scanInterval", label="Scan-Intervall (Sek.)", choices={10, 20, 30, 60, 120}},
+  {head="Chat"},
+  {key="chatEnabled", label="Chat-Nachrichten"},
+  {key="chatOnMissingPattern", label="Fehlende Patterns"},
+  {key="chatOnAttack", label="Angriff / Raid"},
+  {key="chatOnDeath", label="Buerger gestorben"},
+  {key="chatOnDisease", label="Buerger krank"},
+  {key="chatOnStorage", label="ME-Speicher / Energie"},
+  {key="chatOnOldRequest", label="Haengende Anfragen"},
+  {key="chatOnStuckCraft", label="Haengende Crafts"},
+  {key="chatOnVisitor", label="Besucher anwerbbar"},
+  {head="Sonstiges"},
+  {key="monitorScale", label="Monitor-Textgroesse", choices={0.5, 1, 1.5, 2}},
+  {key="trackMissingPatterns", label="Fehlende Patterns merken"},
+  {key="autoUpdate", label="Updates automatisch installieren"},
+  {key="doLog", label="Logdateien schreiben"},
+}
+
+local function luaValue(v)
+  if type(v) == "string" then return string.format("%q", v) end
+  return tostring(v)
+end
+-- Wert in der Config-Datei ersetzen (Kommentare bleiben erhalten)
+local function writeConfigValue(key, value)
+  local f = fs.open(CONFIG_FILE, "r"); if not f then return false end
+  local src = f.readAll(); f.close()
+  local out, found = {}, false
+  for line in (src.."\n"):gmatch("([^\n]*)\n") do
+    if not found and line:match("^%s*"..key.."%s*=") then
+      local pre, rest = line:match("^(%s*"..key.."%s*=%s*)[^,]*(.*)$")
+      if pre then line = pre..luaValue(value)..rest; found = true end
+    end
+    out[#out+1] = line
+  end
+  if out[#out] == "" then out[#out] = nil end
+  if not found then
+    for i = #out, 1, -1 do
+      if out[i]:match("^%s*}") then table.insert(out, i, "  "..key.." = "..luaValue(value)..","); found = true; break end
+    end
+  end
+  if not found then return false end
+  local newSrc = table.concat(out, "\n").."\n"
+  local fn = load(newSrc, "config", "t", {})
+  local ok, res = pcall(fn or error)
+  if not ok or type(res) ~= "table" or res[key] ~= value then return false end
+  local w = fs.open(CONFIG_FILE, "w"); w.write(newSrc); w.close()
+  return true
+end
+
+local applySetting   -- wird weiter unten gesetzt (braucht views)
+local settingsMsg = nil
+
+function renderers.optionen(w, v)
+  local rows = {}
+  local locked = cfg.lockSettings and v and v.isMon
+  rows[#rows+1] = textRow(locked and "Gesperrt (lockSettings) - aendern nur am Terminal" or "Antippen zum Umschalten. Wird sofort gespeichert.",
+    locked and colors.orange or colors.lightGray)
+  -- feste Zeile fuer Rueckmeldungen, damit sich die Zeilen beim Tippen nicht verschieben
+  if settingsMsg and now() - settingsMsg.t < 10000 then rows[#rows+1] = textRow(fit(settingsMsg.text, w), settingsMsg.color)
+  else rows[#rows+1] = blank() end
+  for _, st in ipairs(SETTINGS) do
+    if st.head then
+      rows[#rows+1] = heading(st.head, w)
+    else
+      local val = cfg[st.key]
+      local txt, color
+      if st.choices then txt, color = tostring(val), colors.yellow
+      else txt, color = val and "AN" or "AUS", val and colors.lime or colors.red end
+      local box = fit("["..txt.."]", 11)
+      local row = {seg(box, color), seg(fit(st.label, w - 11))}
+      if not locked then row.action = function() applySetting(st) end end
+      rows[#rows+1] = row
     end
   end
   return rows
@@ -1227,12 +1621,16 @@ local function drawView(v)
   for _, e in ipairs(S.requests) do if e.state == "FEHLT" or e.state == "FEHLER" or e.state == "MANUELL" then nReq = nReq + 1 end end
   if nReq > 0 then badge.anfragen = nReq end
   if #S.citizens > 0 then badge.buerger = #S.citizens end
+  local nCraft = 0
+  for _, c in ipairs(crafts) do if c.state == "FEHLER" or (c.stuck and c.state == "LAEUFT") then nCraft = nCraft + 1 end end
+  if nCraft > 0 then badge.crafts = nCraft end
   -- Breite stufenweise reduzieren, bis alle Reiter passen
   local variants = {
     function(i, tb) return " "..tb.label..(badge[tb.id] and ("("..badge[tb.id]..")") or "").." ", 1 end,
     function(i, tb) return " "..tb.label..(badge[tb.id] and ("("..badge[tb.id]..")") or "").." ", 0 end,
     function(i, tb) return " "..tb.label.." ", 0 end,
-    function(i, tb) return " "..tb.label:sub(1, 3)..(badge[tb.id] and "!" or "").." ", 0 end,
+    function(i, tb) return " "..tb.short..(badge[tb.id] and "!" or "").." ", 0 end,
+    function(i, tb) return " "..tb.short:sub(1, 3)..(badge[tb.id] and "!" or "").." ", 0 end,
     function(i, tb) return " "..i.." ", 0 end,
   }
   local texts, gap
@@ -1257,15 +1655,16 @@ local function drawView(v)
   end
 
   -- Inhalt
-  local rows = renderers[v.tab](w)
+  local rows = renderers[v.tab](w, v)
   local top, bottom = 4, h-1
   local perPage = math.max(1, bottom-top+1)
   v.pages = math.max(1, math.ceil(#rows/perPage))
   if v.page > v.pages then v.page = v.pages end
   local first = (v.page-1)*perPage + 1
+  v.rowAt = {}
   for i = 0, perPage-1 do
     local r = rows[first+i]
-    if r then drawRow(win, top+i, w, r, color) end
+    if r then drawRow(win, top+i, w, r, color); v.rowAt[top+i] = r end
   end
   win.setVisible(true)
   drawFooter(v)
@@ -1290,6 +1689,31 @@ end
 local function drawAll() for _, v in pairs(views) do drawView(v) end end
 local function drawAllFooters() for _, v in pairs(views) do drawFooter(v) end end
 
+applySetting = function(st)
+  local cur = cfg[st.key]
+  local new
+  if st.choices then
+    local idx = 0
+    for i, c in ipairs(st.choices) do if c == cur then idx = i end end
+    new = st.choices[idx % #st.choices + 1]
+  else
+    new = not cur
+  end
+  cfg[st.key] = new
+  if st.key == "monitorScale" then
+    for _, v in pairs(views) do if v.isMon then pcall(v.dev.setTextScale, new) end end
+  elseif st.key == "doLog" and new and not fs.exists(logFolder) then
+    fs.makeDir(logFolder)
+  elseif st.key == "chatEnabled" then
+    findChatBox()
+  end
+  local saved = writeConfigValue(st.key, new)
+  local shown = type(new) == "boolean" and (new and "AN" or "AUS") or tostring(new)
+  settingsMsg = saved and {t=now(), color=colors.lime, text=st.label..": "..shown.." (gespeichert)"}
+    or {t=now(), color=colors.orange, text=st.label..": "..shown.." - nur bis Neustart (Config?)"}
+  logLine("[OPTION] "..st.key.." = "..tostring(new))
+end
+
 -- ---------- Eingabe ----------
 local function setTab(v, id) if v.tab ~= id then v.tab = id; v.page = 1 end; drawView(v) end
 local function nextPage(v, d) v.page = ((v.page-1+d) % v.pages) + 1; drawView(v) end
@@ -1305,7 +1729,13 @@ local function onTouch(v, x, y)
     elseif v.nav and x >= v.nav.next[1] and x <= v.nav.next[2] then nextPage(v, 1)
     else os.queueEvent("ae2colony_refresh") end
   else
-    nextPage(v, 1)   -- Tippen in den Inhalt blaettert weiter
+    local r = v.rowAt and v.rowAt[y]
+    if r and r.action then
+      r.action(v)
+      drawAll()
+    else
+      nextPage(v, 1)   -- Tippen in den Inhalt blaettert weiter
+    end
   end
 end
 
@@ -1359,7 +1789,7 @@ local function scanLoop()
       local timer = os.startTimer(1)
       local event, arg
       repeat event, arg = os.pullEvent() until event == "ae2colony_refresh" or (event == "timer" and arg == timer)
-      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = scanTick - 1; drawAllFooters() end
+      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = math.min(scanTick - 1, cfg.scanInterval); drawAllFooters() end
     end
   end
 end
