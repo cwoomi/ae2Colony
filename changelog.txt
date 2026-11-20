@@ -1,5 +1,16 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.9.0-ATM10
+  - Update-System: ingame "update", automatische Pruefung auf neue Versionen
+v0.8.x-ATM10
+  - Neues UI mit Reitern, Touch-Bedienung, mehrere Monitore
+  - Baufortschritt in Prozent, Buerger-Probleme, Gebaeude-Ausbau, Besucher
+  - ME-Speicher-/Energie-Warnung, haengende Anfragen, Statistik
+v0.7-ATM10
+  - Baustellen-Vorlieferung, Kolonie-Status, Chat Box, fehlende Patterns, Config-Datei, Stufenlimit
+v0.6-ATM10
+  - Anpassung an Advanced Peripherals 0.8 (ATM10)
+
 v0.4.1
   - modify craftingHandler to not use fingerprints, isCraftable() can't use fingerprints as an item filter in  AP 0.7.51b
   
