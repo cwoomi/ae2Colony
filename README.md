@@ -22,7 +22,7 @@ update force    # neu installieren
 
 Die Konfiguration (`ae2colony_config.lua`) und die Datenbanken bleiben erhalten. Alte Dateien werden als `.bak` gesichert.
 
-Das Programm sucht außerdem alle 6 Stunden selbst nach Updates. Gibt es eins, erscheint ein Hinweis auf der Startseite und im Chat. Mit `autoUpdate = true` in der Config wird es automatisch installiert.
+Einfacher geht es direkt am Monitor: Das Programm sucht jede Stunde nach Updates. Gibt es eins, steht **UPDATE VERFÜGBAR** in der Titelzeile, und auf der Startseite erscheint der Button **[ Jetzt updaten ]**. Zweimal antippen genügt, dann wird installiert und neu gestartet. Am Terminal geht das auch mit der Taste **U**. Im Reiter „Optionen“ kannst du außerdem sofort nach Updates suchen, das Intervall ändern oder automatische Updates einschalten.
 
 ## Dateien
 

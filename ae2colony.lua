@@ -18,11 +18,14 @@
 --        * Besucher anwerben: Kosten per Antippen in eine Kiste legen, Chat-Hinweis
 --        * Verlaufsdiagramme (24h): Lieferungen, ME-Speicher, Zufriedenheit
 --        * Neuer Reiter "Optionen": Einstellungen per Touch umschalten
+-- v0.11: * Update-Button: "Update verfuegbar" in der Titelzeile, Installation per Antippen
+--        * Stuendliche Update-Pruefung, "Jetzt pruefen" im Reiter Optionen
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.10.0-ATM10"
+local scriptVersion = "0.11.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
+local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
 
 -- =====================================================================
 -- Standard-Konfiguration (wird beim ersten Start als Datei gespeichert)
@@ -117,7 +120,7 @@ return {
   lockSettings = false,       -- true = Optionen nur am Computer-Terminal aenderbar, nicht am Monitor
 
   -- ===== Updates =====
-  updateCheckHours = 6,       -- alle X Stunden nach neuer Version suchen (0 = aus)
+  updateCheckHours = 1,       -- alle X Stunden nach neuer Version suchen (0 = aus)
   autoUpdate = false,         -- true = neue Version automatisch installieren und neu starten
   updateUrl = "",             -- "" = Standard-Adresse, sonst eigene Download-Adresse (endet mit /)
 }
@@ -1011,6 +1014,8 @@ end
 local bridge, colony = nil, nil
 -- ---------- Update-Pruefung ----------
 local updateInfo, lastUpdateCheck = nil, nil
+local updateMsg = nil        -- {t, color, text} Rueckmeldung zum Update
+local pendingVersion = nil   -- installiert, aber noch nicht neu gestartet
 local function vparts(v)
   local t = {}
   for n in (tostring(v or ""):match("^[%d%.]+") or ""):gmatch("%d+") do t[#t+1] = tonumber(n) end
@@ -1023,30 +1028,34 @@ local function isNewer(a, b)
   end
   return false
 end
-local function checkUpdate()
-  if not http or (tonumber(cfg.updateCheckHours) or 0) <= 0 then return end
+-- Rueckgabe: "neu", "aktuell", "fehler" oder nil (nicht geprueft)
+local function checkUpdate(force)
+  if not http then return force and "fehler" or nil end
+  if not force and (tonumber(cfg.updateCheckHours) or 0) <= 0 then return end
   local now = os.epoch("utc")
-  if lastUpdateCheck and now - lastUpdateCheck < cfg.updateCheckHours * 3600000 then return end
+  if not force and lastUpdateCheck and now - lastUpdateCheck < cfg.updateCheckHours * 3600000 then return end
   lastUpdateCheck = now
   local base = (cfg.updateUrl ~= "" and cfg.updateUrl) or UPDATE_URL
-  if base:find("DEIN-NAME", 1, true) then return end
+  if base:find("DEIN-NAME", 1, true) then return "fehler" end
   if base:sub(-1) ~= "/" then base = base.."/" end
   local ok, h = pcall(http.get, base.."ae2colony.lua?t="..now, {["Cache-Control"] = "no-cache"}, true)
-  if not ok or not h then logLine("Update-Pruefung fehlgeschlagen: "..tostring(h)); return end
+  if not ok or not h then logLine("Update-Pruefung fehlgeschlagen: "..tostring(h)); return "fehler" end
   local body = h.readAll(); h.close()
   local remote = body and body:match('local scriptVersion%s*=%s*"([^"]+)"')
-  if not remote or not isNewer(remote, scriptVersion) then return end
+  if not remote then return "fehler" end
+  if not isNewer(remote, pendingVersion or scriptVersion) then return "aktuell" end
   local first = not updateInfo or updateInfo ~= remote
   updateInfo = remote
-  if not first then return end
+  if not first then return "neu" end
   logLine("Update verfuegbar: v"..remote)
   if cfg.autoUpdate and shell and fs.exists("update.lua") then
     chat("Installiere Update v"..remote.." ...")
     flushChat()
     shell.run("update", "-y")   -- startet bei Erfolg den Computer neu
   else
-    chat("Update v"..remote.." verfuegbar - im Terminal 'update' ausfuehren")
+    chat("Update v"..remote.." verfuegbar - am Monitor auf 'Jetzt updaten' tippen")
   end
+  return "neu"
 end
 
 local function scan()
@@ -1171,6 +1180,8 @@ end
 
 -- Besucher anwerben: Kosten in eine Kiste legen (zweimal tippen)
 local recruitArm, recruitMsg = nil, nil
+local updateArm = nil         -- Zeitpunkt, bis zu dem der zweite Tipp das Update startet
+local updateTap, updateCheckNow   -- werden weiter unten gesetzt
 local function recruitTap(v)
   if recruitArm and recruitArm.name == v.name and now() < recruitArm.untilT then
     recruitArm = nil
@@ -1198,8 +1209,14 @@ function renderers.start(w)
   local any = false
   if updateInfo then
     local v = updateInfo:match("^[%d%.]+") or updateInfo
-    rows[#rows+1] = textRow(fit("Neue Version "..v.." - im Terminal: update", w), colors.yellow)
+    local armed = updateArm and now() < updateArm
+    local btn = armed and "[ Nochmal tippen! ]" or "[ Jetzt updaten ]"
+    local row = {seg(fit("Update "..v.." verfuegbar", math.max(0, w - #btn - 1)), colors.yellow),
+      seg(" "), seg(btn, colors.black, armed and colors.orange or colors.yellow)}
+    row.action = function() updateTap() end
+    rows[#rows+1] = row
   end
+  if updateMsg and (updateMsg.t == math.huge or now() - updateMsg.t < 60000) then rows[#rows+1] = textRow(fit(updateMsg.text, w), updateMsg.color) end
   if #S.alerts > 0 or #S.errors > 0 then
     rows[#rows+1] = heading("Achtung", w)
     for _, a in ipairs(S.alerts) do rows[#rows+1] = textRow("! "..a, colors.red) end
@@ -1494,10 +1511,13 @@ local SETTINGS = {
   {key="chatOnOldRequest", label="Haengende Anfragen"},
   {key="chatOnStuckCraft", label="Haengende Crafts"},
   {key="chatOnVisitor", label="Besucher anwerbbar"},
+  {head="Updates"},
+  {button="Pruefen", label="Jetzt suchen", run=function() updateCheckNow() end},
+  {key="updateCheckHours", label="Automatisch suchen alle X Std. (0=aus)", choices={1, 3, 6, 12, 24, 0}},
+  {key="autoUpdate", label="Updates automatisch installieren"},
   {head="Sonstiges"},
   {key="monitorScale", label="Monitor-Textgroesse", choices={0.5, 1, 1.5, 2}},
   {key="trackMissingPatterns", label="Fehlende Patterns merken"},
-  {key="autoUpdate", label="Updates automatisch installieren"},
   {key="doLog", label="Logdateien schreiben"},
 }
 
@@ -1546,6 +1566,11 @@ function renderers.optionen(w, v)
   for _, st in ipairs(SETTINGS) do
     if st.head then
       rows[#rows+1] = heading(st.head, w)
+    elseif st.button then
+      local row = {seg(fit("["..st.button.."]", 11), colors.cyan), seg(fit(st.label.." (du hast "..(scriptVersion:match("^[%d%.]+") or scriptVersion)..")", w - 11))}
+      if not locked then row.action = st.run end
+      rows[#rows+1] = row
+      if updateMsg and (updateMsg.t == math.huge or now() - updateMsg.t < 60000) then rows[#rows+1] = textRow(fit("  "..updateMsg.text, w), updateMsg.color) end
     else
       local val = cfg[st.key]
       local txt, color
@@ -1611,8 +1636,10 @@ local function drawView(v)
   local title = scriptName..(S.colony and S.colony.name and (" - "..asc(S.colony.name)) or "")
   local status = S.meStatus or ""
   local alarm = (S.colony and (S.colony.attack or S.colony.raid))
-  drawRow(win, 1, w, {seg(fit(title, w-#status-1), alarm and colors.red or colors.orange),
-    seg(" "..status, S.online and colors.lime or colors.red)}, color)
+  local upd = updateInfo and (w >= 40 and " UPDATE VERFUEGBAR " or " UPDATE ") or ""
+  drawRow(win, 1, w, {seg(fit(title, w-#status-#upd-1), alarm and colors.red or colors.orange),
+    seg(upd, colors.black, colors.yellow), seg(" "..status, S.online and colors.lime or colors.red)}, color)
+  v.updX = updateInfo and {w-#status-#upd, w-#status-1} or nil
 
   -- Zeile 2: Reiter
   -- Anzahl Probleme als Markierung am Reiter
@@ -1689,6 +1716,45 @@ end
 local function drawAll() for _, v in pairs(views) do drawView(v) end end
 local function drawAllFooters() for _, v in pairs(views) do drawFooter(v) end end
 
+updateCheckNow = function()
+  updateMsg = {t=now(), color=colors.lightGray, text="Suche nach Updates ..."}
+  drawAll()
+  local r = checkUpdate(true)
+  if r == "aktuell" and pendingVersion then
+    updateMsg = {t=math.huge, color=colors.lime, text=(pendingVersion:match("^[%d%.]+") or pendingVersion).." installiert - bitte neu starten"}
+  elseif r == "neu" then updateMsg = {t=now(), color=colors.yellow, text=(updateInfo:match("^[%d%.]+") or updateInfo).." verfuegbar - Start: Jetzt updaten"}
+  elseif r == "aktuell" then updateMsg = {t=now(), color=colors.lime, text="Aktuell - keine neue Version"}
+  else updateMsg = {t=now(), color=colors.red, text="Update-Pruefung fehlgeschlagen (HTTP?)"} end
+end
+
+updateTap = function()
+  if not updateInfo then return end
+  if not (updateArm and now() < updateArm) then updateArm = now() + 8000; return end
+  updateArm = nil
+  if not shell or not fs.exists("update.lua") then
+    updateMsg = {t=now(), color=colors.red, text="update.lua fehlt - im Terminal neu installieren"}
+    return
+  end
+  local target = updateInfo
+  updateMsg = {t=now(), color=colors.yellow, text="Installiere "..target.." ..."}
+  chat("Update auf v"..target.." wird installiert ...")
+  flushChat()
+  drawAll()
+  logLine("[UPDATE] starte update -y fuer v"..target)
+  shell.run("update", "-y")   -- startet bei Erfolg den Computer neu (wenn ein startup existiert)
+  -- Hier landen wir nur ohne Neustart: pruefen, ob die neue Version installiert wurde
+  local f = fs.open(PROGRAM_PATH, "r")
+  local src = f and f.readAll() or ""
+  if f then f.close() end
+  local installed = src:match('local scriptVersion%s*=%s*"([^"]+)"')
+  if installed == target then
+    updateInfo, pendingVersion = nil, target
+    updateMsg = {t=math.huge, color=colors.lime, text=(target:match("^[%d%.]+") or target).." installiert - bitte neu starten"}
+  else
+    updateMsg = {t=now(), color=colors.red, text="Update fehlgeschlagen - im Terminal 'update' ausfuehren"}
+  end
+end
+
 applySetting = function(st)
   local cur = cfg[st.key]
   local new
@@ -1721,7 +1787,8 @@ local function tabIndex(id) for i, tb in ipairs(TABS) do if tb.id == id then ret
 
 local function onTouch(v, x, y)
   local _, h = v.dev.getSize()
-  if y == 1 then os.queueEvent("ae2colony_refresh")
+  if y == 1 then
+    if v.updX and x >= v.updX[1] and x <= v.updX[2] then setTab(v, "start") else os.queueEvent("ae2colony_refresh") end
   elseif y == 2 then
     for _, tx in ipairs(v.tabX or {}) do if x >= tx.from and x <= tx.to then setTab(v, tx.id); return end end
   elseif y == h then
@@ -1753,7 +1820,8 @@ local function inputLoop()
         elseif a == keys.right or a == keys.tab then setTab(v, TABS[tabIndex(v.tab) % #TABS + 1].id)
         elseif a == keys.up or a == keys.pageUp then nextPage(v, -1)
         elseif a == keys.down or a == keys.pageDown then nextPage(v, 1)
-        elseif a == keys.r then os.queueEvent("ae2colony_refresh") end
+        elseif a == keys.r then os.queueEvent("ae2colony_refresh")
+        elseif a == keys.u and updateInfo then setTab(v, "start"); updateTap(); drawView(v) end
       end
     elseif ev == "char" and views.term then
       local n = tonumber(a); if n and TABS[n] then setTab(views.term, TABS[n].id) end
