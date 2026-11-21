@@ -1,5 +1,9 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.13.1-ATM10
+  - Fix: Programm startete nicht ("function at line 2119 has more than 200 local variables")
+  - Fehler werden abgefangen, in ae2colony_crash.txt protokolliert, Programm laeuft nach 5 s weiter
+  - Autostart (startup.lua) laeuft auf Advanced Computern im Hintergrund-Tab
 v0.13.0-ATM10
   - Reiter "Forschung": laufende Forschungen mit Fortschritt, startbare Forschungen mit Kosten (gruen = im ME), Zweige
   - Buerger-Steckbrief per Antippen (Skills, Status, Ort) und Job-Berater fuer Arbeitslose / schlecht passende Jobs

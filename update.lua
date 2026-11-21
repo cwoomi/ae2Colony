@@ -186,13 +186,27 @@ state.main = mainPath
 writeFile(STATE_FILE, textutils.serialize(state))
 say("Version "..remote.." installiert. Alte Dateien liegen als .bak daneben.", colors.lime)
 
--- Autostart
+-- Autostart: auf Advanced Computern in einem eigenen Tab (Terminal bleibt frei)
 local mainCmd = mainPath:gsub("%.lua$", "")
+local function startupCode(cmd)
+  return '-- AE2 Colony Autostart (angelegt von update.lua)\n'..
+    'if multishell then\n'..
+    '  local id = shell.openTab("'..cmd..'")\n'..
+    '  multishell.setTitle(id, "AE2 Colony")\n'..
+    'else\n'..
+    '  shell.run("'..cmd..'")\n'..
+    'end\n'
+end
 local hasStartup = fs.exists("startup.lua") or fs.exists("startup")
-if not hasStartup and not autoYes and ask("Beim Start des Computers automatisch ausfuehren?") then
-  writeFile("startup.lua", 'shell.run("'..mainCmd..'")\n')
+local oldStartup = readFile("startup.lua")
+if oldStartup == 'shell.run("'..mainCmd..'")\n' then
+  -- frueher vom Installer angelegt -> auf Hintergrund-Tab umstellen
+  writeFile("startup.lua", startupCode(mainCmd))
+  say("startup.lua auf Hintergrund-Tab umgestellt.", colors.lime)
+elseif not hasStartup and not autoYes and ask("Beim Start des Computers automatisch ausfuehren?") then
+  writeFile("startup.lua", startupCode(mainCmd))
   hasStartup = true
-  say("startup.lua angelegt.", colors.lime)
+  say("startup.lua angelegt (laeuft im Hintergrund-Tab).", colors.lime)
 end
 
 if hasStartup then

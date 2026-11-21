@@ -26,9 +26,12 @@
 --        * Buerger-Steckbrief (antippen) mit Skills und Job-Berater fuer Arbeitslose
 --        * Verteidigung: Wachen-Uebersicht, ungeschuetzte Gebaeude, Verteidigungs-Ansicht der Karte
 --        * Restzeit-Schaetzung fuer Baustellen, Essens-Vorrat mit Reichweite, Fertig-Meldung
+-- v0.13.1: * Fix: "more than 200 local variables" (Programm startete nicht)
+--          * Fehler werden abgefangen und protokolliert (ae2colony_crash.txt), Programm laeuft weiter
+--          * Autostart im Hintergrund-Tab (Terminal bleibt frei)
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.13.0-ATM10"
+local scriptVersion = "0.13.1-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -184,12 +187,14 @@ end
 -- Hilfsfunktionen
 -- =====================================================================
 if cfg.doLog and not fs.exists(logFolder) then fs.makeDir(logFolder) end
+local logLine
+do -- log
 local function nextLogFile()
   local nums = {}
   for _, f in ipairs(fs.list(logFolder)) do local n = f:match("^log_(%d+)%.log$"); if n then nums[#nums+1] = tonumber(n) end end
   table.sort(nums); return string.format("%s/log_%03d.log", logFolder, (nums[#nums] or 0)+1)
 end
-local function logLine(msg)
+function logLine(msg)
   if not cfg.doLog then return end
   local files = fs.list(logFolder); table.sort(files)
   local path = #files > 0 and (logFolder.."/"..files[#files]) or nextLogFile()
@@ -197,6 +202,7 @@ local function logLine(msg)
   local f = fs.open(path, "a")
   if f then f.writeLine("["..os.date("%H:%M:%S", os.epoch("local")/1000).."] "..tostring(msg)); f.close() end
 end
+end -- log
 local function cleanupOldLogs()
   if not cfg.doLog then return end
   local files = {}
@@ -219,13 +225,16 @@ local function saveDb(path, t)
 end
 
 -- CC-Bildschirme koennen kein UTF-8: Umlaute umschreiben, Rest entfernen
+local asc
+do -- ascii
 local translit = {["\195\164"]="ae", ["\195\182"]="oe", ["\195\188"]="ue", ["\195\132"]="Ae",
   ["\195\150"]="Oe", ["\195\156"]="Ue", ["\195\159"]="ss"}
-local function asc(s)
+function asc(s)
   s = tostring(s or "")
   s = s:gsub("[\192-\223][\128-\191]", function(c) return translit[c] or "?" end)
   return (s:gsub("[\128-\255]", ""))
 end
+end -- ascii
 -- "com.minecolonies.building.builder" / "minecolonies:builder" -> "Builder"
 local function pretty(s)
   s = asc(s)
@@ -298,8 +307,10 @@ local exportBuffer = {}
 -- =====================================================================
 -- Chat (optional)
 -- =====================================================================
+local findChatBox, chat, flushChat
+do -- chat
 local chatQueue, chatBox = {}, nil
-local function findChatBox()
+function findChatBox()
   if not cfg.chatEnabled then chatBox = nil; return end
   if chatBox then
     local ok, name = pcall(peripheral.getName, chatBox)
@@ -307,12 +318,12 @@ local function findChatBox()
   end
   chatBox = peripheral.find("chat_box")
 end
-local function chat(msg)
+function chat(msg)
   if not cfg.chatEnabled then return end
   logLine("[CHAT] "..msg)
   chatQueue[#chatQueue+1] = {text=asc(msg), tries=0}
 end
-local function flushChat()
+function flushChat()
   if #chatQueue == 0 then return end
   if not chatBox then
     if #chatQueue > 20 then table.remove(chatQueue, 1) end
@@ -326,6 +337,7 @@ local function flushChat()
   m.tries = m.tries + 1
   if (ok and res == true) or m.tries >= 5 then table.remove(chatQueue, 1) end
 end
+end -- chat
 -- Alarm nur beim Wechsel von "aus" nach "an" melden
 local alertActive = {}
 local function alert(key, active, msg)
@@ -343,7 +355,9 @@ local function statsToday()
   return statsDb
 end
 -- Verlauf: ein Eintrag pro Stunde (Ortszeit), die letzten 48 Stunden
-local function hourKey() return math.floor(os.epoch("local") / 3600000) end
+local hourKey, histSample, statDelivered, statCraft
+do -- verlauf
+function hourKey() return math.floor(os.epoch("local") / 3600000) end
 local function histBucket()
   local k = hourKey()
   historyDb.h = historyDb.h or {}
@@ -355,13 +369,13 @@ local function histBucket()
   end
   return b
 end
-local function histSample(field, v)
+function histSample(field, v)
   if type(v) ~= "number" then return end
   local b = histBucket()
   b[field] = v
 end
 
-local function statDelivered(name, label, n)
+function statDelivered(name, label, n)
   local s = statsToday()
   local hb = histBucket(); hb.sent = hb.sent + n
   s.sent = s.sent + n
@@ -369,7 +383,8 @@ local function statDelivered(name, label, n)
   e.n = e.n + n; e.label = label or e.label
   s.items[name] = e
 end
-local function statCraft() local s = statsToday(); s.crafts = s.crafts + 1; local hb = histBucket(); hb.crafts = hb.crafts + 1 end
+function statCraft() local s = statsToday(); s.crafts = s.crafts + 1; local hb = histBucket(); hb.crafts = hb.crafts + 1 end
+end -- verlauf
 
 local function recordMissing(name, display, countKey, silent)
   if cfg.trackMissingPatterns and not missingCounted[countKey] then
@@ -414,9 +429,11 @@ end
 -- =====================================================================
 -- Kolonie-, ME-, Buerger-, Gebaeude-Daten
 -- =====================================================================
+local readColony, readBuildings, targetName
+do -- kolonie
 local lastGraves = nil
 local buildingNames = {}  -- "x,y,z" -> Name
-local function readColony(c)
+function readColony(c)
   local col = {
     happy = call(c, "getHappiness"), cit = call(c, "getCitizenCount"), lim = call(c, "getCitizenLimit"),
     graves = call(c, "getGraveCount"), sites = call(c, "amountOfConstructionSites"),
@@ -442,7 +459,7 @@ local function readColony(c)
   end
 end
 
-local function readBuildings(c)
+function readBuildings(c)
   buildingNames = {}
   local list = call(c, "getBuildings")
   if type(list) ~= "table" then return end
@@ -471,13 +488,16 @@ local function readBuildings(c)
   end
   table.sort(S.buildingsUpgrade, function(a, b) if a.level ~= b.level then return a.level < b.level end return a.name < b.name end)
 end
-local function targetName(pos)
+function targetName(pos)
   local p = formatPos(pos)
   return buildingNames[p] or p
 end
+end -- kolonie
 
 -- Jobs: Haupt- und Nebenskill (MineColonies), Gebaeude-Typ und Anzeigename
-local jobName
+local jobName, skillDe, jobScore, jobAdvice, skillText, readCitizens
+do -- buerger
+
 local jobInfo = {
   builder={"Adaptability", "Athletics", "builder", "Builder"},
   deliveryman={"Agility", "Adaptability", "deliveryman", "Kurier"},
@@ -517,15 +537,15 @@ local jobInfo = {
   ranger={"Agility", "Adaptability", "guardtower", "Bogenschuetze"},
   druid={"Mana", "Focus", "guardtower", "Druide"},
 }
-local skillDe = {Athletics="Athletik", Dexterity="Geschick", Strength="Staerke", Agility="Beweglichk.", Stamina="Ausdauer",
+skillDe = {Athletics="Athletik", Dexterity="Geschick", Strength="Staerke", Agility="Beweglichk.", Stamina="Ausdauer",
   Mana="Mana", Adaptability="Anpassung", Focus="Fokus", Creativity="Kreativitaet", Knowledge="Wissen", Intelligence="Intelligenz"}
 function jobName(id) local j = jobInfo[id]; return j and j[4] or pretty(id) end
-local function jobScore(c, id)
+function jobScore(c, id)
   local j = jobInfo[id]; if not j then return nil end
   return 2 * (c.skills[j[1]] or 0) + (c.skills[j[2]] or 0)
 end
 -- beste Jobs fuer einen Buerger; bevorzugt Jobs, deren Gebaeude es in der Kolonie gibt
-local function jobAdvice(c, n)
+function jobAdvice(c, n)
   local present = {}
   for _, b in ipairs(S.mapBuildings) do present[b.type:lower():gsub("^.*[:/]", "")] = true end
   if present.barracks or present.barrackstower then present.guardtower = true end
@@ -538,13 +558,13 @@ local function jobAdvice(c, n)
   for i = 1, math.min(n or 2, #list) do out[i] = list[i] end
   return out
 end
-local function skillText(c, id)
+function skillText(c, id)
   local j = jobInfo[id]; if not j then return "" end
   return (skillDe[j[1]] or j[1]).." "..(c.skills[j[1]] or 0)..", "..(skillDe[j[2]] or j[2]).." "..(c.skills[j[2]] or 0)
 end
 
 local diseaseSeen = {}
-local function readCitizens(c)
+function readCitizens(c)
   local list = call(c, "getCitizens")
   if type(list) ~= "table" then return end
   S.citizenCount = #list
@@ -592,9 +612,12 @@ local function readCitizens(c)
   for k in pairs(diseaseSeen) do if not active[k] then diseaseSeen[k] = nil end end
   table.sort(S.citizens, function(a, b) if a.severity ~= b.severity then return a.severity > b.severity end return a.name < b.name end)
 end
+end -- buerger
 
+local readVisitors
+do -- besucher
 local visitorNotified = {}
-local function readVisitors(c, byName)
+function readVisitors(c, byName)
   local list = call(c, "getVisitors")
   if type(list) ~= "table" then return end
   local present = {}
@@ -617,8 +640,11 @@ local function readVisitors(c, byName)
   end
   for name in pairs(visitorNotified) do if not present[name] then visitorNotified[name] = nil end end
 end
+end -- besucher
 
 -- Essen im ME zaehlen (Tag c:foods bzw. Whitelist)
+local readFood
+do -- essen
 local function isFood(it)
   if cfg.whitelistItemName[it.name] then return true end
   if type(it.tags) == "table" then
@@ -630,7 +656,7 @@ local function isFood(it)
   end
   return false
 end
-local function readFood(byName)
+function readFood(byName)
   local n = 0
   for _, list in pairs(byName) do
     for _, it in ipairs(list) do if isFood(it) then n = n + (tonumber(it.count) or 0) end end
@@ -654,12 +680,15 @@ local function readFood(byName)
   if low then addAlert(string.format("Essen im ME reicht nur noch ca. %s", fmtAge(eta * 3600000))) end
   if cfg.chatOnFood then alert("food", low, string.format("Essen wird knapp: %d im ME, reicht ca. %s", n, fmtAge((eta or 0) * 3600000))) end
 end
+end -- essen
 
 -- Forschung (teure Abfrage -> nur alle researchInterval Sekunden)
-local research = nil      -- {running, available, done, total, branches}
+local research, lastResearchT, readResearch
+do -- forschung
+research = nil      -- {running, available, done, total, branches}
 local researchStatus = {} -- id -> Status beim letzten Abruf
-local lastResearchT = nil
-local function readResearch(c)
+lastResearchT = nil
+function readResearch(c)
   if lastResearchT and now() - lastResearchT < cfg.researchInterval * 1000 then return end
   lastResearchT = now()
   local tree = call(c, "getResearches")
@@ -702,6 +731,7 @@ local function readResearch(c)
   table.sort(r.available, function(a, b) if a.branch ~= b.branch then return a.branch < b.branch end return a.name < b.name end)
   research = r
 end
+end -- forschung
 
 local function readME(b)
   local me = {}
@@ -773,14 +803,17 @@ local function readCpus(b)
 end
 
 -- Vom Skript gestartete Crafts verfolgen
-local crafts, craftSeq = {}, 0
+local crafts = {}
+local updateCrafts, deliveryKey, recentDelivery, queueExport, processExportBuffer, tryCraft
+do -- crafts
+local craftSeq = 0
 local craftFailedAt = {}   -- item -> Zeitpunkt des letzten nicht gestarteten Crafts
 local function trackCraft(name, hash, count, info)
   craftSeq = craftSeq + 1
   crafts[#crafts+1] = {id=craftSeq, name=name, hash=hash, count=count, t=now(), state="START",
     label=info.label or shortName(name), source=info.source or "", stock=info.stock or 0}
 end
-local function updateCrafts(byName)
+function updateCrafts(byName)
   local t, keep = now(), {}
   for _, c in ipairs(crafts) do
     local job = S.cpuJobs and S.cpuJobs[c.name]
@@ -817,17 +850,17 @@ local function updateCrafts(byName)
   if failed > 0 then addAlert(failed.." Craft(s) nicht gestartet - siehe Reiter Crafts") end
 end
 
-local function deliveryKey(pos, name, hash) return pos.."|"..name.."|"..tostring(hash) end
-local function recentDelivery(key, cooldown)
+function deliveryKey(pos, name, hash) return pos.."|"..name.."|"..tostring(hash) end
+function recentDelivery(key, cooldown)
   local d = delivered[key]
   if d and now()-d.t < cooldown*1000 then return d end
   return nil
 end
 -- e = {name, hash, count, side, label, key, cooldown, reqId, entry}
-local function queueExport(e)
+function queueExport(e)
   if e.name and e.count and e.count > 0 then exportBuffer[#exportBuffer+1] = e end
 end
-local function processExportBuffer(b)
+function processExportBuffer(b)
   for _, it in ipairs(exportBuffer) do
     local side = it.side or cfg.exportSide
     local filter = {name=it.name, count=it.count, nbtHash=it.hash or ""}
@@ -856,7 +889,7 @@ end
 
 -- Rueckgabe: "started", "running", "nopattern", "nocpu", "limit", "failed" oder "error"
 -- info = {label, source, stock, reserve (CPUs, die frei bleiben muessen), noStart}
-local function tryCraft(b, name, hash, count, quiet, info)
+function tryCraft(b, name, hash, count, quiet, info)
   info = info or {}
   if cfg.craftMaxStack then count = math.max(count, 64) end
   if count <= 0 then count = 1 end
@@ -883,10 +916,13 @@ local function tryCraft(b, name, hash, count, quiet, info)
   addError("Craft abgelehnt "..shortName(name)..": "..tostring(ok2 and err2 or job))
   return "error"
 end
+end -- crafts
 
 -- =====================================================================
 -- Werkzeuge & Ruestung
 -- =====================================================================
+local handleRequests
+do -- anfragen
 local toolTiers  = {"wood", "stone", "iron", "diamond", "netherite"}
 local armorTiers = {"leather", "gold", "chain", "iron", "diamond", "netherite"}
 local tierPrefix = {
@@ -1015,7 +1051,7 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   entry.note = prefix..(anyError and "Fehler, siehe Start" or ("x"..remaining.." kein Pattern"))
 end
 
-local function handleRequests(b, c, byName)
+function handleRequests(b, c, byName)
   local requests = call(c, "getRequests")
   if type(requests) ~= "table" then addError("getRequests fehlgeschlagen"); return end
   local t, activeIds = now(), {}
@@ -1056,10 +1092,13 @@ local function handleRequests(b, c, byName)
   for id in pairs(sentAt) do if not activeIds[id] then sentAt[id] = nil end end
   for id in pairs(firstSeen) do if not activeIds[id] then firstSeen[id] = nil; alertActive["old:"..tostring(id)] = nil end end
 end
+end -- anfragen
 
 -- =====================================================================
 -- Baustellen: Fortschritt + Vorlieferung
 -- =====================================================================
+local buildBanner, handleBuilds
+do -- baustellen
 local stageNames = {
   CLEAR="Raeumen", BUILD_SOLID="Rohbau", WEAK_SOLID="Rohbau 2", CLEAR_WATER="Wasser entfernen",
   CLEAR_NON_SOLIDS="Aufraeumen", DECORATE="Deko", SPAWN="Abschluss", REMOVE="Abriss", REMOVE_WATER="Abriss",
@@ -1128,7 +1167,7 @@ local function buildProgress(wo, res)
 end
 
 local knownOrders = {}   -- id -> {name, target, pos, type, missing = Scans seit dem Verschwinden}
-local buildBanner = nil  -- {t, text}
+buildBanner = nil  -- {t, text}
 local function checkFinishedOrders(active)
   for id, o in pairs(knownOrders) do
     if not active[id] then
@@ -1149,7 +1188,7 @@ local function checkFinishedOrders(active)
   end
 end
 
-local function handleBuilds(b, c, byName)
+function handleBuilds(b, c, byName)
   local orders = call(c, "getWorkOrders")
   if type(orders) ~= "table" then return end
   local active = {}
@@ -1247,6 +1286,7 @@ local function handleBuilds(b, c, byName)
   for k in pairs(buildDb) do if not active[k] then buildDb[k] = nil; changed = true end end
   if changed then saveDb(cfg.buildsFile, buildDb) end
 end
+end -- baustellen
 
 -- =====================================================================
 -- Scan
@@ -1254,9 +1294,12 @@ end
 local bridge, colony = nil, nil
 local lastByName = nil
 -- ---------- Update-Pruefung ----------
-local updateInfo, lastUpdateCheck = nil, nil
-local updateMsg = nil        -- {t, color, text} Rueckmeldung zum Update
-local pendingVersion = nil   -- installiert, aber noch nicht neu gestartet
+local updateInfo = nil
+local updateMsg, pendingVersion, checkUpdate
+do -- update
+local lastUpdateCheck = nil
+updateMsg = nil        -- {t, color, text} Rueckmeldung zum Update
+pendingVersion = nil   -- installiert, aber noch nicht neu gestartet
 local function vparts(v)
   local t = {}
   for n in (tostring(v or ""):match("^[%d%.]+") or ""):gmatch("%d+") do t[#t+1] = tonumber(n) end
@@ -1270,7 +1313,7 @@ local function isNewer(a, b)
   return false
 end
 -- Rueckgabe: "neu", "aktuell", "fehler" oder nil (nicht geprueft)
-local function checkUpdate(force)
+function checkUpdate(force)
   if not http then return force and "fehler" or nil end
   if not force and (tonumber(cfg.updateCheckHours) or 0) <= 0 then return end
   local now = os.epoch("utc")
@@ -1298,6 +1341,7 @@ local function checkUpdate(force)
   end
   return "neu"
 end
+end -- update
 
 local function scan()
   exportBuffer = {}
@@ -1460,6 +1504,7 @@ end
 local function etaText(e) return e.eta and ("fertig in ca. "..fmtAge(e.eta)) or nil end
 
 -- ---------- Kacheln ----------
+do -- kacheln
 local function fitSegs(segs, width)
   local out, used = {}, 0
   for _, sg in ipairs(segs) do
@@ -1700,6 +1745,7 @@ function renderers.start(w, v)
   if not any then rows[#rows+1] = blank(); rows[#rows+1] = textRow("Alles erledigt.", colors.lime) end
   return rows
 end
+end -- kacheln
 function renderers.anfragen(w)
   local rows = {}
   local list = {}
@@ -1759,6 +1805,7 @@ function renderers.bau(w)
   if S.me and S.online == false then rows[#rows+1] = textRow("ME offline - keine Vorlieferung", colors.red) end
   return rows
 end
+do -- buergerUI
 local citizenSel = nil   -- id des angetippten Buergers
 function renderers.buerger(w)
   local rows = {}
@@ -1845,6 +1892,7 @@ function renderers.buerger(w)
   end
   return rows
 end
+end -- buergerUI
 function renderers.kolonie(w)
   local rows = {}
   local col = S.colony or {}
@@ -1961,6 +2009,7 @@ function renderers.crafts(w)
 end
 
 -- Balkendiagramm der letzten Stunden. get(bucket) liefert den Wert oder nil.
+do -- diagramme
 local function chartRows(title, w, get, opts)
   local rows = {}
   local height = opts.height or 5
@@ -2038,6 +2087,7 @@ function renderers.stats(w)
   end
   return rows
 end
+end -- diagramme
 
 -- ---------- Forschung ----------
 function renderers.forschung(w)
@@ -2085,6 +2135,7 @@ function renderers.forschung(w)
 end
 
 -- ---------- Karte ----------
+do -- karte
 local mapSel = nil   -- Schluessel des angetippten Gebaeudes
 local mapMode = "status"   -- "status" oder "verteidigung"
 local typeAbbr = {
@@ -2230,6 +2281,7 @@ function renderers.karte(w, v)
   rows[#rows+1] = legend
   return rows
 end
+end -- karte
 
 -- ---------- Optionen ----------
 local SETTINGS = {
@@ -2267,12 +2319,14 @@ local SETTINGS = {
   {key="doLog", label="Logdateien schreiben"},
 }
 
+local writeConfigValue
+do -- config
 local function luaValue(v)
   if type(v) == "string" then return string.format("%q", v) end
   return tostring(v)
 end
 -- Wert in der Config-Datei ersetzen (Kommentare bleiben erhalten)
-local function writeConfigValue(key, value)
+function writeConfigValue(key, value)
   local f = fs.open(CONFIG_FILE, "r"); if not f then return false end
   local src = f.readAll(); f.close()
   local out, found = {}, false
@@ -2297,6 +2351,7 @@ local function writeConfigValue(key, value)
   local w = fs.open(CONFIG_FILE, "w"); w.write(newSrc); w.close()
   return true
 end
+end -- config
 
 local applySetting   -- wird weiter unten gesetzt (braucht views)
 local settingsMsg = nil
@@ -2429,7 +2484,11 @@ local function drawView(v)
   end
 
   -- Inhalt
-  local rows = renderers[v.tab](w, v)
+  local okR, rows = pcall(renderers[v.tab], w, v)
+  if not okR then
+    logLine("[ANZEIGE] "..v.tab..": "..tostring(rows))
+    rows = {textRow(fit("Anzeigefehler im Reiter "..v.tab..":", w), colors.red), textRow(fit(tostring(rows), w), colors.red)}
+  end
   local top, bottom = 4, h-1
   local perPage = math.max(1, bottom-top+1)
   v.pages = math.max(1, math.ceil(#rows/perPage))
@@ -2530,6 +2589,8 @@ end
 -- ---------- Eingabe ----------
 local function setTab(v, id) if v.tab ~= id then v.tab = id; v.page = 1 end; drawView(v) end
 gotoTab = setTab
+local inputLoop
+do -- eingabe
 local function nextPage(v, d) v.page = ((v.page-1+d) % v.pages) + 1; drawView(v) end
 local function tabIndex(id) for i, tb in ipairs(TABS) do if tb.id == id then return i end end return 1 end
 
@@ -2556,7 +2617,7 @@ local function onTouch(v, x, y)
   end
 end
 
-local function inputLoop()
+function inputLoop()
   while true do
     local ev, a, b2, c2 = os.pullEvent()
     if ev == "monitor_touch" then
@@ -2583,6 +2644,7 @@ local function inputLoop()
     end
   end
 end
+end -- eingabe
 
 -- =====================================================================
 -- Start
@@ -2613,4 +2675,29 @@ local function scanLoop()
   end
 end
 
-parallel.waitForAny(scanLoop, inputLoop)
+-- Fehler abfangen statt abstuerzen: protokollieren, anzeigen, nach 5 s weiterlaufen.
+-- Strg+T (Terminated) beendet das Programm weiterhin.
+local CRASH_FILE = "ae2colony_crash.txt"
+while true do
+  local ok, err = pcall(parallel.waitForAny, scanLoop, inputLoop)
+  if ok then break end
+  if err == "Terminated" then error(err, 0) end
+  local msg = tostring(err)
+  pcall(function()
+    local f = fs.open(CRASH_FILE, "a")
+    f.writeLine("["..os.date("%Y-%m-%d %H:%M:%S").."] v"..scriptVersion..": "..msg)
+    f.close()
+  end)
+  logLine("[ABSTURZ] "..msg)
+  addError("Fehler abgefangen (siehe "..CRASH_FILE.."): "..msg)
+  pcall(chat, "Fehler im Programm abgefangen: "..msg)
+  for _, v in pairs(views) do
+    pcall(function()
+      local w, h = v.dev.getSize()
+      v.dev.setBackgroundColor(colors.black); v.dev.setTextColor(colors.red)
+      v.dev.setCursorPos(1, h); v.dev.clearLine()
+      v.dev.write(("Fehler - Neustart in 5s: "..msg):sub(1, w))
+    end)
+  end
+  sleep(5)
+end
