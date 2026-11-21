@@ -33,9 +33,10 @@
 --        * Raid-Modus: Monitore zeigen Verteidigung, schnellere Scans, optional Redstone-Alarm
 --        * Reiter "Log": Ereignis-Protokoll (Lieferungen, Crafts, Bau, Raids, Fehler ...)
 --        * Liefer-Statistik (Wartezeiten) und Builder-Auslastung
+-- v0.14.1: * Werkzeug-/Ruestungsanfragen zeigen, welche Items versucht wurden; Diagnose erweitert
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.14.0-ATM10"
+local scriptVersion = "0.14.1-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -1058,7 +1059,11 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   end
   local gear = gearCandidates(req)
   if gear then
-    if #gear == 0 then entry.state = "MANUELL"; entry.note = "ueber Stufenlimit"; return end
+    if #gear == 0 then
+      entry.state = "MANUELL"
+      entry.note = "ueber Stufenlimit ("..(cfg.maxToolTier or "?").."/"..(cfg.maxArmorTier or "?")..")"
+      return
+    end
     for _, n in ipairs(gear) do add(n, nil, nil) end
   else
     for _, ri in ipairs(req.items or {}) do add(ri.name, itemHash(ri), ri) end
@@ -1096,7 +1101,13 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   end
   if not anyError then recordMissing(candidates[1].name, entry.label, "req:"..tostring(req.id)) end
   entry.state = "FEHLT"
-  entry.note = prefix..(anyError and "Fehler, siehe Start" or ("x"..remaining.." kein Pattern"))
+  local tried = ""
+  if gear then
+    local names = {}
+    for i, c in ipairs(candidates) do if i <= cfg.maxCraftCandidates then names[#names+1] = shortName(c.name) end end
+    tried = " ("..table.concat(names, ", ")..")"
+  end
+  entry.note = prefix..(anyError and "Fehler, siehe Start" or ("x"..remaining.." kein Pattern"..tried))
 end
 
 local reqMeta = {}   -- request id -> Anzeigename (fuer die Wartezeit-Statistik)
