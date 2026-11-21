@@ -1,5 +1,8 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.12.0-ATM10
+  - Kachel-Uebersicht als Startseite auf grossen Monitoren (Kachel antippen oeffnet den Reiter)
+  - Reiter "Karte": Draufsicht mit Gebaeude-Umrissen, Status-Farben, Buerger-Punkten, Details per Antippen
 v0.11.0-ATM10
   - Update-Button: "UPDATE VERFUEGBAR" in der Titelzeile, auf der Startseite "Jetzt updaten" (2x tippen)
   - Update-Pruefung jede Stunde, "Jetzt suchen" im Reiter Optionen, Taste U am Terminal

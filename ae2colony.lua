@@ -20,9 +20,11 @@
 --        * Neuer Reiter "Optionen": Einstellungen per Touch umschalten
 -- v0.11: * Update-Button: "Update verfuegbar" in der Titelzeile, Installation per Antippen
 --        * Stuendliche Update-Pruefung, "Jetzt pruefen" im Reiter Optionen
+-- v0.12: * Kachel-Uebersicht als Startseite auf grossen Monitoren (Kachel antippen = Reiter oeffnen)
+--        * Neuer Reiter "Karte": Draufsicht der Kolonie mit Gebaeude-Umrissen und Status-Farben
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.11.0-ATM10"
+local scriptVersion = "0.12.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -73,9 +75,11 @@ return {
 
   -- ===== Anzeige =====
   showColonyStatus = true,
+  dashboardMinWidth = 60,     -- ab dieser Breite zeigt die Startseite Kacheln statt einer Liste (0 = nie)
+  mapShowCitizens = true,     -- Buerger als Punkte auf der Karte
   monitorScale = 0.5,         -- Textgroesse der Monitore (0.5 - 5)
   -- Start-Reiter je Monitor, z.B. { ["monitor_0"] = "start", ["monitor_1"] = "anfragen" }
-  -- Reiter: "start", "anfragen", "bau", "buerger", "kolonie", "stats"
+  -- Reiter: "start", "anfragen", "bau", "crafts", "buerger", "kolonie", "karte", "stats", "optionen"
   -- Ohne Eintrag: 1. Monitor = start, 2. Monitor = anfragen
   monitorTabs = {},
 
@@ -262,7 +266,7 @@ local S = {}                 -- Ergebnis des aktuellen Scans (fuer die Anzeige)
 local function newState()
   return {
     requests = {}, builds = {}, citizens = {}, citizenCount = 0,
-    buildingsWorking = {}, buildingsUpgrade = {}, visitors = {},
+    buildingsWorking = {}, buildingsUpgrade = {}, visitors = {}, mapBuildings = {}, citizenPos = {},
     alerts = {}, errors = {}, colony = {}, me = {}, online = false, meStatus = "...",
     cpus = nil, freeCpus = nil, cpuJobs = nil,
   }
@@ -436,6 +440,18 @@ local function readBuildings(c)
     local name = pretty(b.displayName or b.type or "?")
     buildingNames[formatPos(b.pos)] = name
     local lvl, maxLvl = tonumber(b.level) or 0, tonumber(b.maxLevel) or 0
+    if type(b.pos) == "table" and b.pos.x then
+      local st = type(b.structure) == "table" and b.structure or {}
+      local a, c = st.cornerA, st.cornerB
+      local x1, z1, x2, z2 = b.pos.x, b.pos.z, b.pos.x, b.pos.z
+      if type(a) == "table" and type(c) == "table" and a.x and c.x then
+        x1, x2 = math.min(a.x, c.x), math.max(a.x, c.x)
+        z1, z2 = math.min(a.z, c.z), math.max(a.z, c.z)
+      end
+      S.mapBuildings[#S.mapBuildings+1] = {key=formatPos(b.pos), name=name, type=tostring(b.type or ""),
+        x1=x1, z1=z1, x2=x2, z2=z2, level=lvl, maxLevel=maxLvl, working=b.isWorking == true,
+        built=b.built ~= false and lvl > 0, residents=type(b.citizens) == "table" and #b.citizens or 0}
+    end
     if b.isWorking then
       S.buildingsWorking[#S.buildingsWorking+1] = {name=name, level=lvl}
     elseif lvl < maxLvl then
@@ -456,6 +472,7 @@ local function readCitizens(c)
   S.citizenCount = #list
   local active = {}
   for _, ct in ipairs(list) do
+    if type(ct.pos) == "table" and ct.pos.x then S.citizenPos[#S.citizenPos+1] = {x=ct.pos.x, z=ct.pos.z} end
     local issues, severity = {}, 0
     local function add(text, sev) issues[#issues+1] = text; if sev > severity then severity = sev end end
     if ct.disease then
@@ -837,7 +854,7 @@ local function handleRequests(b, c, byName)
     if it and it.name and count > 0 and not skipStates[req.state or ""] then
       local tpos = formatPos(req.target)
       local entry = {state="?", count=count, label=asc(req.displayName or itemLabel(it)),
-        target=targetName(req.target), note="", age=req.id and (t-firstSeen[req.id]) or 0}
+        target=targetName(req.target), tpos=tpos, note="", age=req.id and (t-firstSeen[req.id]) or 0}
       S.requests[#S.requests+1] = entry
       local last = req.id and sentAt[req.id]
       local pre = recentDelivery(deliveryKey(tpos, it.name, itemHash(it)), cfg.prestockCooldown)
@@ -930,7 +947,7 @@ local function handleBuilds(b, c, byName)
         local i, n = stageIndex(wo.stage)
         return (stageNames[wo.stage] or pretty(wo.stage))..(i and (" "..i.."/"..n) or "")
       end)() or nil,
-      claimed = wo.isClaimed == true, pct = 0, res = {}, open = 0, missing = 0,
+      claimed = wo.isClaimed == true, pct = 0, res = {}, open = 0, missing = 0, pos = formatPos(wo.pos),
       builder = wo.builderHome and pretty(wo.builderHome.displayName or "Builder") or nil,
     }
     S.builds[#S.builds+1] = entry
@@ -1088,10 +1105,11 @@ end
 -- UI
 -- =====================================================================
 local TABS = {
-  {id="start", label="Start", short="Start"}, {id="anfragen", label="Anfragen", short="Anfr"},
+  {id="start", label="Start", short="Home"}, {id="anfragen", label="Anfragen", short="Anfr"},
   {id="bau", label="Bau", short="Bau"}, {id="crafts", label="Crafts", short="Craft"},
   {id="buerger", label="Buerger", short="Buer"}, {id="kolonie", label="Kolonie", short="Kol"},
-  {id="stats", label="Stats", short="Stat"}, {id="optionen", label="Optionen", short="Opt"},
+  {id="karte", label="Karte", short="Map"}, {id="stats", label="Stats", short="Stat"},
+  {id="optionen", label="Optionen", short="Opt"},
 }
 local stateStyle = {
   FEHLER={colors.red, "FEHLER"}, FEHLT={colors.orange, "FEHLT"}, MANUELL={colors.cyan, "MANUELL"},
@@ -1201,7 +1219,195 @@ local function recruitTap(v)
 end
 
 local renderers = {}
-function renderers.start(w)
+local gotoTab   -- wird weiter unten gesetzt (setTab)
+
+-- ---------- Kacheln ----------
+local function fitSegs(segs, width)
+  local out, used = {}, 0
+  for _, sg in ipairs(segs) do
+    if used >= width then break end
+    local t = sg.t:sub(1, width - used)
+    out[#out+1] = seg(t, sg.fg, sg.bg, sg.alt); used = used + #t
+  end
+  if used < width then out[#out+1] = seg(string.rep(" ", width - used)) end
+  return out
+end
+local tileColor = {ok=colors.green, warn=colors.yellow, bad=colors.red, info=colors.lightBlue}
+local function tileRows(w, tiles, cols)
+  local rows, gap = {}, 1
+  local tw = math.floor((w - gap*(cols-1)) / cols)
+  for i = 1, #tiles, cols do
+    local group = {}
+    for j = i, math.min(i+cols-1, #tiles) do group[#group+1] = tiles[j] end
+    local height = 0
+    for _, t in ipairs(group) do height = math.max(height, #t.lines) end
+    for line = 0, height do   -- 0 = Titelzeile
+      local row, acts, x = {}, {}, 1
+      for gi, t in ipairs(group) do
+        local segs
+        if line == 0 then
+          local bg = tileColor[t.state or "info"]
+          local badge = t.badge and (t.badge.." ") or ""
+          segs = {seg(fit(" "..t.title, tw - #badge), colors.black, bg), seg(badge, colors.black, bg)}
+        else
+          segs = {seg(" ")}
+          for _, s2 in ipairs(t.lines[line] or {}) do segs[#segs+1] = s2 end
+        end
+        for _, s2 in ipairs(fitSegs(segs, tw)) do row[#row+1] = s2 end
+        if t.tab then acts[#acts+1] = {from=x, to=x+tw-1, tab=t.tab} end
+        x = x + tw
+        if gi < #group then row[#row+1] = seg(string.rep(" ", gap)); x = x + gap end
+      end
+      row.actionAt = function(v, px)
+        for _, a in ipairs(acts) do if px >= a.from and px <= a.to then gotoTab(v, a.tab); return true end end
+      end
+      rows[#rows+1] = row
+    end
+    rows[#rows+1] = blank()
+  end
+  return rows
+end
+-- kleiner Balken mit Prozent: "######....  93%"
+local function miniBar(pct, width, color)
+  local f, r = bar(pct or 0, math.max(1, width - 5), color)
+  return f, r, seg(fit(pct and (math.floor(pct).."%") or "-", 5, true), colors.white)
+end
+local function dashboardTiles(w, tw)
+  local tiles = {}
+  local col = S.colony or {}
+  -- Kolonie
+  local vis, canRecruit = #S.visitors, 0
+  for _, v in ipairs(S.visitors) do if v.enough then canRecruit = canRecruit + 1 end end
+  local happyBad = col.happy and col.happy < cfg.chatHappinessBelow
+  tiles[#tiles+1] = {title="KOLONIE", tab="kolonie",
+    state=(col.attack or col.raid) and "bad" or (happyBad and "warn" or "ok"),
+    badge=(col.raid and "RAID!") or (col.attack and "ANGRIFF!") or nil,
+    lines={
+      {seg(asc(col.name or "?"), colors.yellow)},
+      {seg("Zufriedenheit ", colors.lightGray), seg(col.happy and string.format("%.1f", col.happy) or "-", happyBad and colors.orange or colors.lime)},
+      {seg("Buerger ", colors.lightGray), seg((col.cit or "?")..(col.lim and ("/"..col.lim) or "")), seg("  Graeber ", colors.lightGray), seg(tostring(col.graves or 0))},
+      {seg("Besucher ", colors.lightGray), seg(tostring(vis)), seg(canRecruit > 0 and ("  "..canRecruit.." anwerbbar") or "", colors.lime)},
+    }}
+  -- ME
+  local me = S.me or {}
+  local full = cfg.storageWarnPercent > 0 and me.storagePct and me.storagePct >= cfg.storageWarnPercent
+  local low = cfg.energyWarnPercent > 0 and me.energyPct and me.energyPct <= cfg.energyWarnPercent
+  local barW = tw - 1 - 10
+  local meLines
+  if S.online then
+    meLines = {
+      {seg(fit("Speicher", 10), colors.lightGray), miniBar(me.storagePct, barW, full and colors.red or colors.cyan)},
+      {seg(fit("Energie", 10), colors.lightGray), miniBar(me.energyPct, barW, low and colors.red or colors.yellow)},
+      {seg(fit("Verbrauch", 10), colors.lightGray), seg(type(me.usage) == "number" and string.format("%d/%d AE/t", math.floor(me.usage), math.floor(me.input or 0)) or "-",
+        (type(me.usage) == "number" and type(me.input) == "number" and me.usage > me.input) and colors.orange or colors.white)},
+    }
+  else
+    meLines = {{seg(S.meStatus or "offline", colors.red)}, {seg("Keine Lieferungen moeglich", colors.lightGray)}}
+  end
+  tiles[#tiles+1] = {title="ME-NETZ", tab="stats", state=(not S.online or full or low) and "bad" or "ok", lines=meLines,
+    badge=not S.online and "OFFLINE" or nil}
+  -- Heute
+  local st = statsToday()
+  local probs, open = 0, 0
+  for _, e in ipairs(S.requests) do
+    if e.state == "FEHLT" or e.state == "FEHLER" or e.state == "MANUELL" then probs = probs + 1 end
+    if e.state ~= "OK" and e.state ~= "SKIP" then open = open + 1 end
+  end
+  tiles[#tiles+1] = {title="HEUTE", tab="anfragen", state=probs > 0 and "warn" or "ok",
+    lines={
+      {seg(fit(tostring(st.sent), 7, true), colors.lime), seg(" Items geliefert")},
+      {seg(fit(tostring(st.crafts), 7, true), colors.green), seg(" Crafts gestartet")},
+      {seg(fit(tostring(open), 7, true), colors.white), seg(" Anfragen offen")},
+      {seg(fit(tostring(probs), 7, true), probs > 0 and colors.orange or colors.lightGray), seg(" brauchen dich", probs > 0 and colors.orange or colors.white)},
+    }}
+  -- Baustellen
+  local bLines, missing = {}, false
+  for i, e in ipairs(S.builds) do
+    if e.missing > 0 then missing = true end
+    if i <= 3 then
+      local nw = math.min(12, math.floor((tw - 2) * 0.45))
+      if e.claimed then
+        bLines[#bLines+1] = {seg(fit(e.name, nw)), seg(" "), miniBar(e.pct, tw - 2 - nw, e.missing > 0 and colors.orange or colors.green)}
+      else
+        bLines[#bLines+1] = {seg(fit(e.name, nw)), seg(" wartet auf Builder", colors.gray)}
+      end
+    end
+  end
+  if #S.builds > 3 then bLines[#bLines+1] = {seg("+"..(#S.builds - 3).." weitere", colors.gray)} end
+  if #S.builds == 0 then bLines[1] = {seg("Keine Bauauftraege", colors.lime)} end
+  tiles[#tiles+1] = {title="BAUSTELLEN", tab="bau", state=missing and "warn" or (#S.builds > 0 and "info" or "ok"),
+    badge=#S.builds > 0 and tostring(#S.builds) or nil, lines=bLines}
+  -- Crafts
+  local cLines, stuck, running = {}, 0, {}
+  for _, c in ipairs(crafts) do
+    if c.state == "FEHLER" or (c.stuck and c.state == "LAEUFT") then stuck = stuck + 1 end
+    if c.state == "LAEUFT" or c.state == "START" then running[#running+1] = c end
+  end
+  local cpuWarn = false
+  if S.cpus then
+    local free = 0; for _, c in ipairs(S.cpus) do if not c.busy then free = free + 1 end end
+    cpuWarn = free <= cfg.craftReserveCpus
+    local r = {seg(fit("CPUs", 6), colors.lightGray)}
+    for i, c in ipairs(S.cpus) do if i <= tw - 18 then r[#r+1] = seg(" ", colors.white, c.busy and colors.orange or colors.green, c.busy and "#" or ".") end end
+    r[#r+1] = seg(" "..free.."/"..#S.cpus.." frei", free > 0 and colors.white or colors.orange)
+    cLines[#cLines+1] = r
+  end
+  for i = 1, math.min(2, #running) do
+    local c = running[i]
+    cLines[#cLines+1] = {seg(fit(c.label, tw - 8)), seg(fit(c.pct and (c.pct.."%") or "...", 6, true), colors.lightGray)}
+  end
+  if #running == 0 then cLines[#cLines+1] = {seg("keine laufenden Crafts", colors.gray)} end
+  if stuck > 0 then cLines[#cLines+1] = {seg(stuck.." haengt / fehlgeschlagen", colors.red)} end
+  tiles[#tiles+1] = {title="CRAFTS", tab="crafts", state=stuck > 0 and "bad" or (cpuWarn and "warn" or "ok"),
+    badge=#running > 0 and tostring(#running) or nil, lines=cLines}
+  -- Buerger
+  local sick, hungry, homeless = 0, 0, 0
+  for _, ct in ipairs(S.citizens) do
+    if ct.severity >= 3 then sick = sick + 1 end
+    if ct.issues:find("hungrig", 1, true) then hungry = hungry + 1 end
+    if ct.issues:find("kein Zuhause", 1, true) then homeless = homeless + 1 end
+  end
+  local cz = {}
+  if #S.citizens == 0 then cz[1] = {seg("Alle in Ordnung", colors.lime)}
+  else
+    cz[#cz+1] = {seg(fit(tostring(#S.citizens), 4, true), colors.yellow), seg(" mit Problemen")}
+    if sick > 0 then cz[#cz+1] = {seg(fit(tostring(sick), 4, true), colors.red), seg(" krank/verletzt")} end
+    if hungry > 0 then cz[#cz+1] = {seg(fit(tostring(hungry), 4, true), colors.orange), seg(" hungrig")} end
+    if homeless > 0 then cz[#cz+1] = {seg(fit(tostring(homeless), 4, true), colors.orange), seg(" ohne Zuhause")} end
+  end
+  tiles[#tiles+1] = {title="BUERGER", tab="buerger", state=sick > 0 and "bad" or (#S.citizens > 0 and "warn" or "ok"), lines=cz}
+  return tiles
+end
+
+function renderers.start(w, v)
+  if cfg.dashboardMinWidth > 0 and w >= cfg.dashboardMinWidth then
+    local rows = {}
+    local cols = w >= 100 and 3 or (w >= 60 and 3 or 2)
+    local tw = math.floor((w - (cols - 1)) / cols)
+    if updateInfo then
+      local vv = updateInfo:match("^[%d%.]+") or updateInfo
+      local armed = updateArm and now() < updateArm
+      local btn = armed and "[ Nochmal tippen! ]" or "[ Jetzt updaten ]"
+      local row = {seg(fit("Update "..vv.." verfuegbar", math.max(0, w - #btn - 1)), colors.yellow),
+        seg(" "), seg(btn, colors.black, armed and colors.orange or colors.yellow)}
+      row.action = function() updateTap() end
+      rows[#rows+1] = row
+    end
+    if updateMsg and (updateMsg.t == math.huge or now() - updateMsg.t < 60000) then rows[#rows+1] = textRow(fit(updateMsg.text, w), updateMsg.color) end
+    for _, r in ipairs(tileRows(w, dashboardTiles(w, tw), cols)) do rows[#rows+1] = r end
+    for _, a in ipairs(S.alerts) do rows[#rows+1] = textRow(fit("! "..a, w), colors.red) end
+    for _, e in ipairs(S.errors) do rows[#rows+1] = textRow(fit("x "..e, w), colors.red) end
+    local problems = {}
+    for _, e in ipairs(S.requests) do
+      if e.state == "FEHLT" or e.state == "MANUELL" or e.state == "FEHLER" or e.old then problems[#problems+1] = e end
+    end
+    table.sort(problems, function(a, b) return (stateRank[a.state] or 9) < (stateRank[b.state] or 9) end)
+    if #problems > 0 then
+      rows[#rows+1] = heading("Braucht dich", w)
+      for _, e in ipairs(problems) do rows[#rows+1] = requestRow(e, w) end
+    end
+    return rows
+  end
   local rows = {}
   if cfg.showColonyStatus then rows[#rows+1] = colonyLine(w) end
   rows[#rows+1] = meLine(w)
@@ -1490,6 +1696,135 @@ function renderers.stats(w)
   return rows
 end
 
+-- ---------- Karte ----------
+local mapSel = nil   -- Schluessel des angetippten Gebaeudes
+local typeAbbr = {
+  townhall="TH", warehouse="WH", builder="Bu", residence="Wo", citizen="Wo", cook="Re", restaurant="Re",
+  farmer="Fa", fisherman="Fi", lumberjack="Ho", miner="Mi", guardtower="GT", barracks="Ka", barrackstower="KT",
+  baker="Bk", bakery="Bk", smeltery="Sm", deliveryman="Ku", courier="Ku", library="Bi", school="Sc", hospital="KH",
+  university="Un", tavern="Ta", graveyard="Fr", blacksmith="Sc", stonemason="St", sawmill="Sa", composter="Ko",
+  cowboy="Ku", shepherd="Sh", swineherder="Sw", chickenherder="Hu", rabbithutch="Ka", beekeeper="Im",
+  crusher="Cr", sifter="Si", florist="Bl", enchanter="En", glassblower="Gl", dyer="Fa", fletcher="Pf",
+  mechanic="Me", plantation="Pl", concretemixer="Be", netherworker="Ne", alchemist="Al", archery="Bo",
+  combatacademy="Ka", mysticalsite="My", stonesmeltery="SS", postbox="Po", stash="Ve",
+}
+local function abbrOf(b)
+  local t = b.type:lower():gsub("^.*[:/]", "")
+  return typeAbbr[t] or (b.name:gsub("[^%a]", ""):sub(1, 2))
+end
+local function buildingStatus(b, probs)
+  if (probs[b.key] or 0) > 0 then return colors.red, "offene Anfragen" end
+  if b.working then return colors.lightBlue, "im Bau" end
+  if not b.built then return colors.gray, "nicht gebaut" end
+  if b.level < b.maxLevel then return colors.yellow, "ausbaubar" end
+  return colors.green, "Maximalstufe"
+end
+
+function renderers.karte(w, v)
+  local rows = {}
+  local list = S.mapBuildings
+  if #list == 0 then rows[1] = textRow("Keine Gebaeudedaten.", colors.gray); return rows end
+  local _, h = v.dev.getSize()
+  local H = math.max(4, h - 4 - 2)   -- Platz fuer Info- und Legendenzeile
+  local probs = {}
+  for _, e in ipairs(S.requests) do
+    if e.tpos and (e.state == "FEHLT" or e.state == "FEHLER" or e.state == "MANUELL") then probs[e.tpos] = (probs[e.tpos] or 0) + 1 end
+  end
+  local minX, minZ, maxX, maxZ = math.huge, math.huge, -math.huge, -math.huge
+  for _, b in ipairs(list) do
+    minX, maxX = math.min(minX, b.x1), math.max(maxX, b.x2)
+    minZ, maxZ = math.min(minZ, b.z1), math.max(maxZ, b.z2)
+  end
+  minX, minZ, maxX, maxZ = minX - 3, minZ - 3, maxX + 3, maxZ + 3
+  -- Zeichen sind ca. 1,5x so hoch wie breit
+  local bx = math.max((maxX - minX + 1) / w, (maxZ - minZ + 1) / (H * 1.5), 0.25)
+  local bz = bx * 1.5
+  local usedW = math.ceil((maxX - minX + 1) / bx)
+  local usedH = math.ceil((maxZ - minZ + 1) / bz)
+  local offX = math.floor((w - usedW) / 2)
+  local offY = math.floor((H - usedH) / 2)
+  local function cx(x) return math.floor((x - minX) / bx) + 1 + offX end
+  local function cy(z) return math.floor((z - minZ) / bz) + 1 + offY end
+  local grid = {}
+  for y = 1, H do grid[y] = {} end
+  local function put(x, y, ch, fg, bg, b)
+    if y >= 1 and y <= H and x >= 1 and x <= w then grid[y][x] = {ch=ch, fg=fg, bg=bg, b=b} end
+  end
+  -- grosse Gebaeude zuerst, damit kleine sichtbar bleiben
+  local order = {}
+  for _, b in ipairs(list) do order[#order+1] = b end
+  table.sort(order, function(a, b2) return (a.x2-a.x1)*(a.z2-a.z1) > (b2.x2-b2.x1)*(b2.z2-b2.z1) end)
+  for _, b in ipairs(order) do
+    local color = buildingStatus(b, probs)
+    local sel = mapSel == b.key
+    for y = cy(b.z1), cy(b.z2) do
+      for x = cx(b.x1), cx(b.x2) do put(x, y, " ", colors.black, sel and colors.white or color, b) end
+    end
+  end
+  -- Buerger als Punkte
+  if cfg.mapShowCitizens then
+    for _, p in ipairs(S.citizenPos) do
+      local x, y = cx(p.x), cy(p.z)
+      if y >= 1 and y <= H and x >= 1 and x <= w then
+        local c = grid[y][x]
+        if c then c.ch = "\7"; c.fg = colors.black else put(x, y, "\7", colors.lightGray, nil, nil) end
+      end
+    end
+  end
+  -- Kuerzel in die Mitte schreiben
+  for _, b in ipairs(order) do
+    local ab = abbrOf(b)
+    local x1, x2 = cx(b.x1), cx(b.x2)
+    local y = math.floor((cy(b.z1) + cy(b.z2)) / 2)
+    local width = x2 - x1 + 1
+    if width < #ab then ab = ab:sub(1, width) end
+    local sx = x1 + math.floor((width - #ab) / 2)
+    for i = 1, #ab do
+      local c = grid[y] and grid[y][sx + i - 1]
+      if c and c.b == b then c.ch = ab:sub(i, i); c.fg = colors.black end
+    end
+  end
+  -- Zeilen bauen (gleich formatierte Zellen zusammenfassen)
+  for y = 1, H do
+    local row, cur = {}, nil
+    local cells = grid[y]
+    for x = 1, w do
+      local c = cells[x]
+      local ch, fg, bg = c and c.ch or " ", c and c.fg or colors.gray, c and c.bg or nil
+      if cur and cur.fg == fg and cur.bg == bg then cur.t = cur.t..ch
+      else cur = seg(ch, fg, bg, bg and "#" or nil); row[#row+1] = cur end
+    end
+    -- auf s/w-Monitoren das Kuerzel statt "#" zeigen
+    for _, sg in ipairs(row) do if sg.alt and sg.t:find("%S") then sg.alt = nil end end
+    row.actionAt = function(_, px)
+      local c = cells[px]
+      mapSel = c and c.b and c.b.key or nil
+      return true
+    end
+    rows[#rows+1] = row
+  end
+  -- Info zum ausgewaehlten Gebaeude
+  local info
+  if mapSel then
+    for _, b in ipairs(list) do
+      if b.key == mapSel then
+        local _, stText = buildingStatus(b, probs)
+        local extra = ""
+        for _, e in ipairs(S.builds) do if e.pos == b.key and e.claimed then extra = "  "..(e.approx and "ca." or "")..e.pct.."%" end end
+        info = {seg(b.name, colors.yellow), seg("  Lvl "..b.level.."/"..b.maxLevel, colors.white),
+          seg("  "..stText..extra, colors.lightGray),
+          seg((probs[b.key] or 0) > 0 and ("  "..probs[b.key].." Anfrage(n)") or "", colors.red),
+          seg(b.residents > 0 and ("  "..b.residents.." Bewohner/Arbeiter") or "", colors.gray)}
+      end
+    end
+  end
+  rows[#rows+1] = info or {seg("Gebaeude antippen fuer Details", colors.gray)}
+  rows[#rows+1] = {seg(" ", colors.black, colors.green, "G"), seg(" Max "), seg(" ", colors.black, colors.yellow, "Y"), seg(" Ausbau "),
+    seg(" ", colors.black, colors.lightBlue, "B"), seg(" Bau "), seg(" ", colors.black, colors.red, "R"), seg(" Anfrage "),
+    seg(" ", colors.black, colors.gray, "-"), seg(" leer"), seg(cfg.mapShowCitizens and " \7 Buerger" or "", colors.lightGray)}
+  return rows
+end
+
 -- ---------- Optionen ----------
 local SETTINGS = {
   {head="Lieferung & Crafting"},
@@ -1517,6 +1852,8 @@ local SETTINGS = {
   {key="autoUpdate", label="Updates automatisch installieren"},
   {head="Sonstiges"},
   {key="monitorScale", label="Monitor-Textgroesse", choices={0.5, 1, 1.5, 2}},
+  {key="dashboardMinWidth", label="Kacheln ab Breite (0=nie)", choices={0, 40, 60, 80}},
+  {key="mapShowCitizens", label="Buerger auf der Karte"},
   {key="trackMissingPatterns", label="Fehlende Patterns merken"},
   {key="doLog", label="Logdateien schreiben"},
 }
@@ -1782,6 +2119,7 @@ end
 
 -- ---------- Eingabe ----------
 local function setTab(v, id) if v.tab ~= id then v.tab = id; v.page = 1 end; drawView(v) end
+gotoTab = setTab
 local function nextPage(v, d) v.page = ((v.page-1+d) % v.pages) + 1; drawView(v) end
 local function tabIndex(id) for i, tb in ipairs(TABS) do if tb.id == id then return i end end return 1 end
 
@@ -1797,7 +2135,9 @@ local function onTouch(v, x, y)
     else os.queueEvent("ae2colony_refresh") end
   else
     local r = v.rowAt and v.rowAt[y]
-    if r and r.action then
+    if r and r.actionAt and r.actionAt(v, x) then
+      drawAll()
+    elseif r and r.action then
       r.action(v)
       drawAll()
     else
