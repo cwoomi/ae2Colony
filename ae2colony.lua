@@ -40,9 +40,12 @@
 --          Craft-Pruefungen zwischengespeichert; Kolonie-Daten, Lager und Essen seltener abgefragt
 -- v0.16.1: * Server-Schonung: Raid-Modus nur bei echtem Raid (nicht bei jedem Mob-Angriff),
 --            Monitore ohne Sekunden-Countdown, Neustart-Bremse nach Fehlern, keine Doppel-Crafts
+-- v0.16.2: * Crash-Schutz: Update/Neustart erst, wenn keine selbst gestarteten Crafts mehr laufen
+--            (AP 0.8.2a crasht den Server, wenn ein Craft fertig wird und der Computer neu gestartet wurde)
+--          * Notschalter "Auto-Crafting" (craftingEnabled), kleinere Baumaterial-Crafts
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.16.1-ATM10"
+local scriptVersion = "0.16.2-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -67,6 +70,7 @@ return {
   foodInterval = 300,         -- Sekunden: Essens-Vorrat im ME neu zaehlen
   maxStockLookups = 100,      -- hoechstens so viele verschiedene Items pro Scan im ME nachschlagen
   resendCooldown = 300,       -- Sekunden Wartezeit nach einer Lieferung, bevor erneut geliefert wird
+  craftingEnabled = true,     -- false = keine Crafts ueber die ME Bridge starten (nur ausliefern)
   craftMaxStack = false,      -- true = immer mindestens 64 Stueck craften
   maxCraftCandidates = 5,     -- wie viele Alternativ-Items maximal auf Craftbarkeit geprueft werden
   doLog = false,              -- true = Logdateien in "ae2Colony_logs" schreiben
@@ -90,7 +94,7 @@ return {
   prestockEnabled = true,     -- Material fuer laufende Bauauftraege vorab liefern
   prestockSide = "",          -- "" = wie exportSide, sonst eigenes Ziel
   prestockCraft = true,       -- fehlendes Baumaterial automatisch craften
-  prestockMaxCraft = 512,     -- maximale Menge pro Craft-Auftrag fuer Baumaterial
+  prestockMaxCraft = 128,     -- maximale Menge pro Craft-Auftrag fuer Baumaterial (kleiner = kuerzere Crafts)
   prestockCooldown = 600,     -- Sekunden, bevor fuer dieselbe Baustelle/Item nachgeliefert wird
   -- Vorab-Crafting: fehlendes Baumaterial aller angenommenen Bauauftraege wird gecraftet,
   -- aber nur, solange genug Crafting-CPUs frei sind (Buerger-Anfragen haben Vorrang).
@@ -330,6 +334,7 @@ local sentAt     = {}   -- request id -> Zeitpunkt der letzten Lieferung
 local firstSeen  = {}   -- request id -> Zeitpunkt, an dem die Anfrage zuerst gesehen wurde
 local delivered  = {}   -- "zielPos|item|hash" -> {t=Zeitpunkt, n=Menge}
 local exportBuffer = {}
+local updateWaiting = false   -- Update steht an: keine neuen Crafts, installieren sobald keine mehr laufen
 
 -- =====================================================================
 -- Chat (optional)
@@ -1053,6 +1058,8 @@ function tryCraft(b, name, hash, count, quiet, info)
   end
   if not craftable then return "nopattern" end
   if craftFailedAt[name] and now() - craftFailedAt[name] < 300000 then return "failed" end
+  if not cfg.craftingEnabled then return "disabled" end
+  if updateWaiting then return "paused" end
   if info.noStart then return "limit" end
   if S.freeCpus and S.freeCpus <= (info.reserve or 0) then return "nocpu" end
   local ok2, job, err2 = pcall(b.craftItem, filter)
@@ -1198,6 +1205,8 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
     if r == "running" then entry.state = "LAEUFT"; entry.note = prefix.."Crafting laeuft"; return end
     if r == "nocpu" then entry.state = "WARTET"; entry.note = prefix.."alle Crafting-CPUs belegt"; return end
     if r == "failed" then entry.state = "FEHLT"; entry.note = prefix.."Craft startet nicht - Zutaten?"; return end
+    if r == "disabled" then entry.state = "MANUELL"; entry.note = prefix.."Auto-Crafting aus (Optionen)"; return end
+    if r == "paused" then entry.state = "WARTET"; entry.note = prefix.."Crafting pausiert (Update)"; return end
     if r == "error" then anyError = true end
   end
   if not anyError then recordMissing(candidates[1].name, entry.label, "req:"..tostring(req.id)) end
@@ -1487,7 +1496,8 @@ function handleBuilds(b, orders, resources, byName)
                 elseif r2 == "limit" then row.state = "OFFEN"; row.note = pre.."wird gecraftet (naechster Scan)"
                 else
                   row.state = "FEHLT"; entry.missing = entry.missing + 1
-                  row.note = pre..(r2 == "nopattern" and "kein Pattern" or (r2 == "failed" and "Craft startet nicht - Zutaten?" or "fehlt"))
+                  row.note = pre..(r2 == "nopattern" and "kein Pattern" or (r2 == "failed" and "Craft startet nicht - Zutaten?"
+                    or (r2 == "disabled" and "Auto-Crafting aus" or (r2 == "paused" and "pausiert (Update)" or "fehlt"))))
                   if r2 == "nopattern" then
                     noPattern = noPattern + 1
                     recordMissing(it.name, row.label, "build:"..key, true)
@@ -1560,9 +1570,9 @@ function checkUpdate(force)
   if not first then return "neu" end
   logLine("Update verfuegbar: v"..remote)
   if cfg.autoUpdate and shell and fs.exists("update.lua") then
-    chat("Installiere Update v"..remote.." ...")
-    flushChat()
-    shell.run("update", "-y")   -- startet bei Erfolg den Computer neu
+    -- erst installieren, wenn keine selbst gestarteten Crafts mehr laufen (siehe runPendingUpdate)
+    updateWaiting = true
+    chat("Update v"..remote.." wird installiert, sobald keine Crafts mehr laufen")
   else
     chat("Update v"..remote.." verfuegbar - am Monitor auf 'Jetzt updaten' tippen")
   end
@@ -1738,7 +1748,7 @@ end
 -- Besucher anwerben: Kosten in eine Kiste legen (zweimal tippen)
 local recruitArm, recruitMsg = nil, nil
 local updateArm = nil         -- Zeitpunkt, bis zu dem der zweite Tipp das Update startet
-local updateTap, updateCheckNow   -- werden weiter unten gesetzt
+local updateTap, updateCheckNow, runPendingUpdate   -- werden weiter unten gesetzt
 local function recruitTap(v)
   if recruitArm and recruitArm.name == v.name and now() < recruitArm.untilT then
     recruitArm = nil
@@ -1952,7 +1962,8 @@ function renderers.start(w, v)
     if updateInfo then
       local vv = updateInfo:match("^[%d%.]+") or updateInfo
       local armed = updateArm and now() < updateArm
-      local btn = armed and "[ Nochmal tippen! ]" or "[ Jetzt updaten ]"
+      local btn = armed and (updateWaiting and "[ Trotzdem? Nochmal! ]" or "[ Nochmal tippen! ]")
+        or (updateWaiting and "[ Wartet auf Crafts ]" or "[ Jetzt updaten ]")
       local row = {seg(fit("Update "..vv.." verfuegbar", math.max(0, w - #btn - 1)), colors.yellow),
         seg(" "), seg(btn, colors.black, armed and colors.orange or colors.yellow)}
       row.action = function() updateTap() end
@@ -1983,7 +1994,8 @@ function renderers.start(w, v)
   if updateInfo then
     local v = updateInfo:match("^[%d%.]+") or updateInfo
     local armed = updateArm and now() < updateArm
-    local btn = armed and "[ Nochmal tippen! ]" or "[ Jetzt updaten ]"
+    local btn = armed and (updateWaiting and "[ Trotzdem? Nochmal! ]" or "[ Nochmal tippen! ]")
+      or (updateWaiting and "[ Wartet auf Crafts ]" or "[ Jetzt updaten ]")
     local row = {seg(fit("Update "..v.." verfuegbar", math.max(0, w - #btn - 1)), colors.yellow),
       seg(" "), seg(btn, colors.black, armed and colors.orange or colors.yellow)}
     row.action = function() updateTap() end
@@ -2768,6 +2780,7 @@ end -- karte
 local SETTINGS = {
   {head="Lieferung & Crafting"},
   {key="prestockEnabled", label="Baumaterial vorliefern"},
+  {key="craftingEnabled", label="Auto-Crafting ueber ME Bridge"},
   {key="prestockCraft", label="Baumaterial vorab craften"},
   {key="craftReserveCpus", label="CPUs fuer Anfragen reservieren", choices={0, 1, 2, 3, 4}},
   {key="prestockMaxCraftsPerScan", label="Baumaterial-Crafts pro Scan", choices={1, 2, 3, 5, 10}},
@@ -3040,10 +3053,15 @@ updateCheckNow = function()
   else updateMsg = {t=now(), color=colors.red, text="Update-Pruefung fehlgeschlagen (HTTP?)"} end
 end
 
-updateTap = function()
-  if not updateInfo then return end
-  if not (updateArm and now() < updateArm) then updateArm = now() + 8000; return end
-  updateArm = nil
+-- selbst gestartete Crafts, die noch laufen (AP schickt dem Computer am Ende ein Ereignis)
+local function runningCrafts()
+  local n = 0
+  for _, c in ipairs(crafts) do if c.state == "START" or c.state == "LAEUFT" then n = n + 1 end end
+  return n
+end
+
+local function doUpdate()
+  updateWaiting = false
   if not shell or not fs.exists("update.lua") then
     updateMsg = {t=now(), color=colors.red, text="update.lua fehlt - im Terminal neu installieren"}
     return
@@ -3066,6 +3084,33 @@ updateTap = function()
   else
     updateMsg = {t=now(), color=colors.red, text="Update fehlgeschlagen - im Terminal 'update' ausfuehren"}
   end
+end
+
+updateTap = function()
+  if not updateInfo then return end
+  if not (updateArm and now() < updateArm) then updateArm = now() + 8000; return end
+  updateArm = nil
+  local n = runningCrafts()
+  if n > 0 and not updateWaiting then
+    -- Neustart jetzt wuerde bei AP 0.8.2a den Server crashen, sobald einer dieser Crafts fertig wird
+    updateWaiting = true
+    updateMsg = {t=math.huge, color=colors.yellow, text="Update wartet auf "..n.." laufende Craft(s) - neue Crafts pausiert"}
+    logEvent("Update wartet auf "..n.." laufende Crafts", "update")
+    return
+  end
+  if n > 0 then logEvent("Update trotz "..n.." laufender Crafts erzwungen", "warn") end
+  doUpdate()
+end
+
+-- im Scan-Takt: wartendes Update installieren, sobald keine eigenen Crafts mehr laufen
+runPendingUpdate = function()
+  if not updateWaiting or not updateInfo then return end
+  local n = runningCrafts()
+  if n > 0 then
+    updateMsg = {t=math.huge, color=colors.yellow, text="Update wartet auf "..n.." laufende Craft(s) - neue Crafts pausiert"}
+    return
+  end
+  doUpdate()
 end
 
 applySetting = function(st)
@@ -3211,6 +3256,8 @@ local function scanLoop()
     if not okU then logLine("Update-Pruefung: "..tostring(errU)) end
     local okR, errR = pcall(updateRaid)
     if not okR then logLine("Raid-Modus: "..tostring(errR)) end
+    local okP, errP = pcall(runPendingUpdate)
+    if not okP then logLine("Update: "..tostring(errP)) end
     pcall(saveEvents)
     syncMonitors()
     drawAll()

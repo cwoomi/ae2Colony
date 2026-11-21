@@ -1,5 +1,12 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.16.2-ATM10
+  - Crash-Schutz: Advanced Peripherals 0.8.2a crasht den Server, wenn ein ueber die ME Bridge gestarteter
+    Craft fertig wird, nachdem der Computer neu gestartet wurde. Update-Button und Auto-Update warten daher,
+    bis alle selbst gestarteten Crafts fertig sind (neue Crafts so lange pausiert; Doppeltipp erzwingt)
+  - update.lua warnt vor dem Neustart, wenn Crafting-CPUs belegt sind
+  - Notschalter "Auto-Crafting ueber ME Bridge" (craftingEnabled) im Reiter Optionen
+  - Baumaterial-Crafts standardmaessig max. 128 statt 512 Stueck (kuerzere Crafts)
 v0.16.1-ATM10
   - Raid-Modus (schnelle Scans, Monitore umschalten) nur noch bei echtem Raid, nicht bei jedem Mob-Angriff;
     Scan-Intervall im Raid 10 s statt 5 s

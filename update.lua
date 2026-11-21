@@ -209,7 +209,35 @@ elseif not hasStartup and not autoYes and ask("Beim Start des Computers automati
   say("startup.lua angelegt (laeuft im Hintergrund-Tab).", colors.lime)
 end
 
+-- Laufende ME-Crafts? AP 0.8.2a crasht den Server, wenn ein ueber die ME Bridge gestarteter Craft
+-- fertig wird, nachdem der Computer neu gestartet wurde. Daher vorher warten bzw. warnen.
+local function busyCpus()
+  local b = peripheral and peripheral.find("me_bridge")
+  if not b or not b.getCraftingCPUs then return 0 end
+  local ok, cpus = pcall(b.getCraftingCPUs)
+  if not ok or type(cpus) ~= "table" then return 0 end
+  local n = 0
+  for _, c in ipairs(cpus) do if c.isBusy then n = n + 1 end end
+  return n
+end
+local safeToReboot = true
 if hasStartup then
+  local busy = busyCpus()
+  if busy > 0 and autoYes then
+    -- vom Programm aus gestartet: dessen eigene Crafts sind schon fertig; kurz auf den Rest warten
+    say("Warte auf "..busy.." belegte Crafting-CPU(s) (max. 2 min) ...", colors.yellow)
+    local t0 = os.clock()
+    while busy > 0 and os.clock() - t0 < 120 do sleep(5); busy = busyCpus() end
+  elseif busy > 0 then
+    say("Achtung: "..busy.." Crafting-CPU(s) sind belegt.", colors.yellow)
+    say("Ein Neustart waehrend Crafts, die dieser Computer gestartet hat, kann mit", colors.yellow)
+    say("Advanced Peripherals 0.8.2a den Server crashen.", colors.yellow)
+    safeToReboot = ask("Trotzdem jetzt neu starten?")
+    if not safeToReboot then say("Spaeter neu starten mit: reboot (wenn die Crafts fertig sind)") end
+  end
+end
+
+if hasStartup and safeToReboot then
   if autoYes or ask("Jetzt neu starten?") then
     say("Neustart ...")
     sleep(1)
