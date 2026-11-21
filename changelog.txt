@@ -1,5 +1,11 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.16.0-ATM10
+  - Performance fuer grosse ME-Systeme: keine komplette ME-Liste mehr (getItems ohne Filter wandelte jedes
+    Item um), stattdessen gezielte Abfragen nur der benoetigten Items (Test mit 5000 Sorten: 15018 -> 9)
+  - "Laeuft schon?" aus der CPU-Abfrage statt einem Aufruf pro Item, Pattern-Pruefung zwischengespeichert
+  - Buerger/Gebaeude, Baustellen-Materiallisten und Lager jede Minute, Essen alle 5 Minuten (Raid: sofort)
+  - Neue Optionen: colonyInterval, builderResourceInterval, warehouseInterval, foodInterval, maxStockLookups
 v0.15.0-ATM10
   - Lager-Fuellstand (MineColonies Warehouse): belegte Slots, Items, haeufigste Items, Warnung ab 90 %
   - Anzeige auf der ME-Kachel, im Reiter Kolonie und als 24h-Verlauf unter Stats

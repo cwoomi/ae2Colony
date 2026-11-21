@@ -36,9 +36,11 @@
 -- v0.14.1: * Werkzeug-/Ruestungsanfragen zeigen, welche Items versucht wurden; Diagnose erweitert
 -- v0.14.2: * Fix: Crafts starteten nicht ("Zutaten fehlen"), wenn ein gebrauchtes Exemplar im ME lag
 -- v0.15: * Lager-Fuellstand (MineColonies Warehouse): direkt per Wired Modem oder per Funk-Sender
+-- v0.16: * Performance: keine komplette ME-Liste mehr, nur gezielte Abfragen der benoetigten Items;
+--          Craft-Pruefungen zwischengespeichert; Kolonie-Daten, Lager und Essen seltener abgefragt
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.15.0-ATM10"
+local scriptVersion = "0.16.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -55,6 +57,13 @@ return {
   -- (relativ zur ME Bridge) oder ein Peripheral-Name im Netzwerk, z.B. "minecraft:chest_0".
   exportSide = "@front",
   scanInterval = 30,          -- Sekunden zwischen Scans
+
+  -- ===== Performance (fuer grosse ME-Systeme / Kolonien) =====
+  colonyInterval = 60,        -- Sekunden: Buerger und Gebaeude neu abfragen (im Raid bei jedem Scan)
+  builderResourceInterval = 60, -- Sekunden: Materiallisten der Baustellen neu abfragen
+  warehouseInterval = 60,     -- Sekunden: Lager-Fuellstand neu abfragen
+  foodInterval = 300,         -- Sekunden: Essens-Vorrat im ME neu zaehlen
+  maxStockLookups = 100,      -- hoechstens so viele verschiedene Items pro Scan im ME nachschlagen
   resendCooldown = 300,       -- Sekunden Wartezeit nach einer Lieferung, bevor erneut geliefert wird
   craftMaxStack = false,      -- true = immer mindestens 64 Stueck craften
   maxCraftCandidates = 5,     -- wie viele Alternativ-Items maximal auf Craftbarkeit geprueft werden
@@ -662,8 +671,7 @@ end -- buerger
 local readVisitors
 do -- besucher
 local visitorNotified = {}
-function readVisitors(c, byName)
-  local list = call(c, "getVisitors")
+function readVisitors(list, byName)
   if type(list) ~= "table" then return end
   local present = {}
   for _, v in ipairs(list) do
@@ -690,22 +698,12 @@ end -- besucher
 -- Essen im ME zaehlen (Tag c:foods bzw. Whitelist)
 local readFood
 do -- essen
-local function isFood(it)
-  if cfg.whitelistItemName[it.name] then return true end
-  if type(it.tags) == "table" then
-    for k, v in pairs(it.tags) do
-      local tag = type(k) == "string" and k or (type(v) == "string" and v or "")
-      tag = tag:gsub("^#", "")
-      if tag == "c:foods" or tag:find("^c:foods/") then return true end
-    end
-  end
-  return false
-end
-function readFood(byName)
+function readFood(b)
+  -- Tag-Filter: AP prueft serverseitig und wandelt nur Lebensmittel um
+  local ok, list = pcall(b.getItems, {name="#c:foods"})
+  if not ok or type(list) ~= "table" then return end
   local n = 0
-  for _, list in pairs(byName) do
-    for _, it in ipairs(list) do if isFood(it) then n = n + (tonumber(it.count) or 0) end end
-  end
+  for _, it in ipairs(list) do n = n + (tonumber(it.count) or 0) end
   histSample("food", n)
   -- Verbrauch aus dem Verlauf der letzten 6 Stunden
   local k, rate = hourKey(), nil
@@ -750,9 +748,14 @@ end
 function lagerMessage(msg)
   if type(msg) == "table" and tonumber(msg.size) then remote, remoteT = msg, now() end
 end
+local direct, directT = nil, nil   -- direkt gelesene Daten (gedrosselt, warehouseInterval)
 function readWarehouse()
   local w
-  local p = findWarehouse()
+  local p
+  if not directT or now() - directT >= cfg.warehouseInterval * 1000 then
+    directT, direct = now(), nil
+    p = findWarehouse()
+  end
   if p then
     local okS, size = pcall(p.size)
     local okL, list = pcall(p.list)
@@ -767,9 +770,10 @@ function readWarehouse()
       for nm, n in pairs(by) do top[#top+1] = {name=nm, n=n}; kinds = kinds + 1 end
       table.sort(top, function(a, b) return a.n > b.n end)
       while #top > 8 do table.remove(top) end
-      w = {size=tonumber(size), used=used, total=total, top=top, kinds=kinds, src="direkt"}
+      direct = {size=tonumber(size), used=used, total=total, top=top, kinds=kinds, src="direkt"}
     end
   end
+  w = direct
   if not w and remote and now() - remoteT < math.max(120000, cfg.scanInterval * 3000) then
     w = remote
     w.src, w.age = "Funk", now() - remoteT
@@ -856,13 +860,22 @@ end
 -- =====================================================================
 -- ME-Inventar, Export, Crafting
 -- =====================================================================
-local function readBridgeItems(b)
-  local byName = {}
-  local ok, res, err = pcall(b.getItems)
-  if not ok or type(res) ~= "table" then addError("ME getItems: "..tostring(ok and err or res)); return nil end
-  for _, it in ipairs(res) do
-    if it.name then byName[it.name] = byName[it.name] or {}; table.insert(byName[it.name], it) end
+-- Nur die benoetigten Items nachschlagen. getItems() ohne Filter wandelt JEDES Item im ME
+-- (mit Komponenten, Tags, Hash) um und bremst bei grossen Systemen den Server aus.
+local function readStock(b, names)
+  local byName, asked, failed, lastErr = {}, 0, 0, nil
+  for name in pairs(names) do
+    asked = asked + 1
+    local ok, res, err = pcall(b.getItems, {name=name})
+    local list = {}
+    if ok and type(res) == "table" then
+      for _, it in ipairs(res) do if it.name == name then list[#list+1] = it end end
+    elseif not ok then
+      failed, lastErr = failed + 1, res
+    end
+    byName[name] = list
   end
+  if asked > 0 and failed == asked then addError("ME getItems: "..tostring(lastErr)); return nil end
   return byName
 end
 local function findBridgeItem(byName, name, hash)
@@ -910,6 +923,7 @@ local updateCrafts, deliveryKey, recentDelivery, queueExport, processExportBuffe
 do -- crafts
 local craftSeq = 0
 local craftFailedAt = {}   -- item -> Zeitpunkt des letzten nicht gestarteten Crafts
+local craftableCache = {}  -- "item|hash" -> {v = craftbar, t = Zeitpunkt}
 local function trackCraft(name, hash, count, info)
   craftSeq = craftSeq + 1
   crafts[#crafts+1] = {id=craftSeq, name=name, hash=hash, count=count, t=now(), state="START",
@@ -1008,19 +1022,33 @@ function tryCraft(b, name, hash, count, quiet, info)
   -- nbtHash "" = nur die normale Variante ohne Components. Sonst nimmt AP evtl. ein gebrauchtes/
   -- verzaubertes Exemplar aus dem ME als Craft-Ziel, fuer das es kein Pattern gibt -> Craft startet nicht.
   local filter = {name=name, count=count, nbtHash=hash or ""}
-  local okR, running = pcall(b.isCrafting, {name=name, nbtHash=hash})
-  if okR and running == true then clearMissing(name); return "running" end
-  local ok, craftable, err = pcall(b.isCraftable, filter)
-  if not ok or craftable == nil then
-    local msg = "isCraftable "..shortName(name)..": "..tostring(ok and err or craftable)
-    if quiet then logLine(msg) else addError(msg) end
-    return "error"
+  -- laeuft schon? -> aus der einen CPU-Abfrage pro Scan statt einem Aufruf pro Item
+  local running
+  if S.cpuJobs then running = S.cpuJobs[name] ~= nil
+  else local okR, r = pcall(b.isCrafting, {name=name, nbtHash=hash}); running = okR and r == true end
+  if running then clearMissing(name); return "running" end
+  -- Pattern vorhanden? -> zwischengespeichert (ja: 10 min, nein: 2 min)
+  local ck = name.."|"..tostring(hash)
+  local cc = craftableCache[ck]
+  local craftable
+  if cc and now() - cc.t < (cc.v and 600000 or 120000) then
+    craftable = cc.v
+  else
+    local ok, res, err = pcall(b.isCraftable, filter)
+    if not ok or res == nil then
+      local msg = "isCraftable "..shortName(name)..": "..tostring(ok and err or res)
+      if quiet then logLine(msg) else addError(msg) end
+      return "error"
+    end
+    craftable = res == true
+    craftableCache[ck] = {v=craftable, t=now()}
   end
   if not craftable then return "nopattern" end
   if craftFailedAt[name] and now() - craftFailedAt[name] < 300000 then return "failed" end
   if info.noStart then return "limit" end
   if S.freeCpus and S.freeCpus <= (info.reserve or 0) then return "nocpu" end
   local ok2, job, err2 = pcall(b.craftItem, filter)
+  if not (ok2 and job) then craftableCache[ck] = nil end
   if ok2 and job then
     clearMissing(name); statCraft()
     if S.freeCpus then S.freeCpus = S.freeCpus - 1 end
@@ -1035,7 +1063,7 @@ end -- crafts
 -- =====================================================================
 -- Werkzeuge & Ruestung
 -- =====================================================================
-local handleRequests
+local handleRequests, requestItemNames
 do -- anfragen
 local toolTiers  = {"wood", "stone", "iron", "diamond", "netherite"}
 local armorTiers = {"leather", "gold", "chain", "iron", "diamond", "netherite"}
@@ -1175,9 +1203,25 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   entry.note = prefix..(anyError and "Fehler, siehe Start" or ("x"..remaining.." kein Pattern"..tried))
 end
 
+-- Welche Items die Anfragen brauchen (fuer die gezielte ME-Abfrage)
+function requestItemNames(requests, add)
+  for _, req in ipairs(type(requests) == "table" and requests or {}) do
+    if not skipStates[req.state or ""] then
+      local gear = gearCandidates(req)
+      if gear then
+        for _, g in ipairs(gear) do add(g) end
+      else
+        for i, it in ipairs(req.items or {}) do
+          if i > math.max(cfg.maxCraftCandidates, 3) then break end
+          add(it.name)
+        end
+      end
+    end
+  end
+end
+
 local reqMeta = {}   -- request id -> Anzeigename (fuer die Wartezeit-Statistik)
-function handleRequests(b, c, byName)
-  local requests = call(c, "getRequests")
+function handleRequests(b, requests, byName)
   if type(requests) ~= "table" then addError("getRequests fehlgeschlagen"); return end
   local t, activeIds = now(), {}
   local oldCount = 0
@@ -1237,7 +1281,7 @@ end -- anfragen
 -- =====================================================================
 -- Baustellen: Fortschritt + Vorlieferung
 -- =====================================================================
-local buildBanner, handleBuilds
+local buildBanner, handleBuilds, readOrders
 do -- baustellen
 local stageNames = {
   CLEAR="Raeumen", BUILD_SOLID="Rohbau", WEAK_SOLID="Rohbau 2", CLEAR_WATER="Wasser entfernen",
@@ -1306,9 +1350,11 @@ local function buildProgress(wo, res)
   return pct, rec.approx, buildEta(rec, pct)
 end
 
-local knownOrders = {}   -- id -> {name, target, pos, type, missing = Scans seit dem Verschwinden}
+local knownOrders = {}   -- id -> {name, target, pos, type, missingSince}
+local pendingFinish = false   -- true = ein Auftrag ist verschwunden, Gebaeude neu lesen
 buildBanner = nil  -- {t, text}
 local function checkFinishedOrders(active)
+  pendingFinish = false
   for id, o in pairs(knownOrders) do
     if not active[id] then
       local lvl
@@ -1322,16 +1368,38 @@ local function checkFinishedOrders(active)
         if cfg.chatOnBuildDone then chat(text) end
         knownOrders[id] = nil
       else
-        o.missing = (o.missing or 0) + 1
-        if o.missing >= 3 then knownOrders[id] = nil end   -- abgebrochen o.ae.
+        -- Gebaeudestufe evtl. noch nicht aktualisiert: bis zu 5 min warten, Gebaeude neu abfragen lassen
+        o.missingSince = o.missingSince or now()
+        pendingFinish = true
+        if now() - o.missingSince > 300000 then knownOrders[id] = nil end   -- abgebrochen o.ae.
       end
     end
   end
 end
 
 local orderSeen = {}   -- id -> erstmals gesehen
-function handleBuilds(b, c, byName)
+local resCache = {}    -- id -> {t, res}
+-- Bauauftraege und deren Materiallisten (Materiallisten nur alle builderResourceInterval Sekunden)
+function readOrders(c)
   local orders = call(c, "getWorkOrders")
+  if type(orders) ~= "table" then return nil, {} end
+  local res, t = {}, now()
+  for _, wo in ipairs(orders) do
+    if wo.isClaimed and wo.builderHome and wo.id then
+      local k = tostring(wo.id)
+      local e = resCache[k]
+      if not e or t - e.t >= cfg.builderResourceInterval * 1000 then
+        e = {t=t, res=call(c, "getWorkOrderResources", wo.id)}
+        resCache[k] = e
+      end
+      res[k] = e.res
+    end
+  end
+  for k in pairs(resCache) do if not res[k] then resCache[k] = nil end end
+  return orders, res
+end
+
+function handleBuilds(b, orders, resources, byName)
   if type(orders) ~= "table" then return end
   local active = {}
   local started = 0
@@ -1363,7 +1431,7 @@ function handleBuilds(b, c, byName)
     S.builds[#S.builds+1] = entry
     if wo.isClaimed and wo.builderHome and wo.id then
       local builderPos = formatPos(wo.builderHome.pos)
-      local res = call(c, "getWorkOrderResources", wo.id)
+      local res = resources[tostring(wo.id)]
       if type(res) == "table" then
         entry.pct, entry.approx, entry.eta = buildProgress(wo, res)
         local noPattern = 0
@@ -1435,6 +1503,7 @@ function handleBuilds(b, c, byName)
   local changed = false
   for k in pairs(buildDb) do if not active[k] then buildDb[k] = nil; changed = true end end
   if changed then saveDb(cfg.buildsFile, buildDb) end
+  return pendingFinish
 end
 end -- baustellen
 
@@ -1493,32 +1562,69 @@ function checkUpdate(force)
 end
 end -- update
 
+-- Drosselung: true, wenn "key" wieder dran ist (beim ersten Mal immer)
+local lastRun = {}
+local function due(key, seconds)
+  local t = now()
+  if lastRun[key] and t - lastRun[key] < seconds * 1000 then return false end
+  lastRun[key] = t
+  return true
+end
+-- Werte aus dem vorherigen Scan uebernehmen (wenn eine Abfrage diesmal ausgelassen wird)
+local function carry(prev, fields) for _, f in ipairs(fields) do S[f] = prev[f] end end
+
 local function scan()
   exportBuffer = {}
+  local prev = S
   S = newState()
   findChatBox()
   readColony(colony)
   histSample("happy", S.colony.happy)
-  local okW, errW = pcall(readWarehouse)
+  local raid = S.colony.raid or S.colony.attack
+  if raid or due("colony", cfg.colonyInterval) then
+    readBuildings(colony)
+    readCitizens(colony)
+  else
+    carry(prev, {"buildingsWorking", "buildingsUpgrade", "mapBuildings", "citizenPos", "citizenCount", "citizens", "allCitizens", "guards"})
+  end
+  local okW, errW = pcall(readWarehouse)   -- drosselt das direkte Auslesen selbst, Funk-Daten sofort
   if not okW then logLine("Lager: "..tostring(errW)) end
-  readBuildings(colony)
-  readCitizens(colony)
+  local visitors = call(colony, "getVisitors")
   local online, status = bridgeStatus(bridge)
   S.online, S.meStatus = online, status
   if cfg.chatOnOffline then alert("offline", not online, "ME-Netz nicht erreichbar: "..status) end
-  if not online then addAlert("ME Bridge: "..status); readVisitors(colony, nil); return end
+  if not online then addAlert("ME Bridge: "..status); readVisitors(visitors, nil); return end
   readME(bridge)
   histSample("storage", S.me.storagePct)
-  local byName = readBridgeItems(bridge)
+  -- Erst die Kolonie fragen, was gebraucht wird, dann gezielt nur diese Items im ME nachschlagen
+  readResearch(colony)
+  local requests = call(colony, "getRequests")
+  local orders, resources = readOrders(colony)
+  local names, count = {}, 0
+  local function add(name)
+    if type(name) == "string" and not names[name] and count < cfg.maxStockLookups then names[name] = true; count = count + 1 end
+  end
+  requestItemNames(requests, add)
+  for _, res in pairs(resources) do
+    for _, r in ipairs(type(res) == "table" and res or {}) do add(r.item and r.item.name) end
+  end
+  for _, v in ipairs(type(visitors) == "table" and visitors or {}) do add(v.recruitCost and v.recruitCost.name) end
+  for _, c in ipairs(crafts) do add(c.name) end
+  if research then
+    for _, it in ipairs(research.available) do
+      for _, c in ipairs(it.cost) do for i, alt in ipairs(c.alts or {}) do if i <= 3 then add(alt.name) end end end
+    end
+  end
+  local byName = readStock(bridge, names)
   readCpus(bridge)
   updateCrafts(byName)
-  readVisitors(colony, byName)
+  readVisitors(visitors, byName)
   if not byName then return end
   lastByName = byName
-  readFood(byName)
-  readResearch(colony)
-  handleRequests(bridge, colony, byName)   -- Requests zuerst (Buerger warten bereits)
-  handleBuilds(bridge, colony, byName)     -- danach Baumaterial mit dem restlichen Bestand
+  if due("food", cfg.foodInterval) then readFood(bridge) else carry(prev, {"food"}) end
+  handleRequests(bridge, requests, byName)          -- Requests zuerst (Buerger warten bereits)
+  -- verschwundener Bauauftrag -> beim naechsten Scan Gebaeude sofort neu lesen (Fertig-Erkennung)
+  if handleBuilds(bridge, orders, resources, byName) then lastRun.colony = nil end
   processExportBuffer(bridge)
   saveDb(cfg.statsFile, statsToday())
   saveDb(cfg.historyFile, historyDb)
