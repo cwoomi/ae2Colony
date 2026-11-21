@@ -1,5 +1,12 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.14.0-ATM10
+  - Reiter "Zu tun": was du selbst craften/besorgen musst, fehlende Forschungskosten, welche Patterns sich lohnen
+  - Raid-Modus: Monitore schalten auf Verteidigungs-Karte, Scans alle 5 s, optional Redstone-Signal (raidRedstoneSide)
+  - Reiter "Log": Ereignis-Protokoll mit Uhrzeit (Lieferungen, Crafts, Bau, Raids, Fehler), Filter "Wichtig"
+  - Stats: Wartezeiten der Anfragen (Schnitt, langsamste, haeufigste)
+  - Bau: Builder-Auslastung, wartende Auftraege, Tipps
+  - Reiterleiste wird auf schmalen Bildschirmen zweizeilig
 v0.13.1-ATM10
   - Fix: Programm startete nicht ("function at line 2119 has more than 200 local variables")
   - Fehler werden abgefangen, in ae2colony_crash.txt protokolliert, Programm laeuft nach 5 s weiter

@@ -29,9 +29,13 @@
 -- v0.13.1: * Fix: "more than 200 local variables" (Programm startete nicht)
 --          * Fehler werden abgefangen und protokolliert (ae2colony_crash.txt), Programm laeuft weiter
 --          * Autostart im Hintergrund-Tab (Terminal bleibt frei)
+-- v0.14: * Reiter "Zu tun": was du selbst craften musst, welche Patterns sich lohnen
+--        * Raid-Modus: Monitore zeigen Verteidigung, schnellere Scans, optional Redstone-Alarm
+--        * Reiter "Log": Ereignis-Protokoll (Lieferungen, Crafts, Bau, Raids, Fehler ...)
+--        * Liefer-Statistik (Wartezeiten) und Builder-Auslastung
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.13.1-ATM10"
+local scriptVersion = "0.14.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -86,7 +90,7 @@ return {
   mapShowCitizens = true,     -- Buerger als Punkte auf der Karte
   monitorScale = 0.5,         -- Textgroesse der Monitore (0.5 - 5)
   -- Start-Reiter je Monitor, z.B. { ["monitor_0"] = "start", ["monitor_1"] = "anfragen" }
-  -- Reiter: "start", "anfragen", "bau", "crafts", "buerger", "kolonie", "forschung", "karte", "stats", "optionen"
+  -- Reiter: "start", "todo", "anfragen", "bau", "crafts", "buerger", "kolonie", "forschung", "karte", "stats", "log", "optionen"
   -- Ohne Eintrag: 1. Monitor = start, 2. Monitor = anfragen
   monitorTabs = {},
 
@@ -131,6 +135,11 @@ return {
   -- Kiste fuer Anwerbekosten (wie exportSide, z.B. "@top"). "" = Funktion aus.
   -- Im Reiter "Kolonie" einen Besucher zweimal antippen -> Kosten werden in diese Kiste gelegt.
   recruitSide = "",
+
+  -- ===== Raid-Modus =====
+  raidSwitchMonitors = true,  -- bei Raid/Angriff alle Monitore auf die Verteidigungs-Karte schalten
+  raidScanInterval = 5,       -- Sekunden zwischen Scans waehrend eines Raids
+  raidRedstoneSide = "",      -- Redstone-Signal waehrend eines Raids, z.B. "back" ("" = aus)
 
   -- ===== Optionen-Reiter =====
   lockSettings = false,       -- true = Optionen nur am Computer-Terminal aenderbar, nicht am Monitor
@@ -307,6 +316,34 @@ local exportBuffer = {}
 -- =====================================================================
 -- Chat (optional)
 -- =====================================================================
+-- Ereignis-Log
+local logEvent, eventLog, saveEvents
+do -- ereignisse
+local EVENT_FILE = "ae2colony_events.db"
+local dirty = false
+eventLog = loadDb(EVENT_FILE)
+local function kindOf(text)
+  local l = text:lower()
+  if l:find("vorbei") or l:find("fertig") or l:find("abgeschlossen") then
+    if not l:find("nicht") then return "gut" end
+  end
+  if l:find("raid") or l:find("angegriffen") or l:find("gestorben") or l:find("fehler") or l:find("nicht gestartet")
+    or l:find("haengt") or l:find("knapp") or l:find("offline") or l:find("krank") then return "warn" end
+  if l:find("fertig") or l:find("abgeschlossen") or l:find("vorbei") then return "gut" end
+  if l:find("update") then return "update" end
+  return "info"
+end
+function logEvent(text, kind)
+  text = asc(text)
+  table.insert(eventLog, 1, {t=os.epoch("utc"), k=kind or kindOf(text), x=text})
+  while #eventLog > 150 do table.remove(eventLog) end
+  dirty = true
+end
+function saveEvents()
+  if dirty then saveDb(EVENT_FILE, eventLog); dirty = false end
+end
+end -- ereignisse
+
 local findChatBox, chat, flushChat
 do -- chat
 local chatQueue, chatBox = {}, nil
@@ -319,6 +356,7 @@ function findChatBox()
   chatBox = peripheral.find("chat_box")
 end
 function chat(msg)
+  logEvent(msg)
   if not cfg.chatEnabled then return end
   logLine("[CHAT] "..msg)
   chatQueue[#chatQueue+1] = {text=asc(msg), tries=0}
@@ -350,7 +388,7 @@ end
 -- =====================================================================
 local function statsToday()
   local day = os.date("%Y-%m-%d")
-  if statsDb.day ~= day then statsDb.day = day; statsDb.sent = 0; statsDb.crafts = 0 end
+  if statsDb.day ~= day then statsDb.day = day; statsDb.sent = 0; statsDb.crafts = 0; statsDb.reqN = 0; statsDb.reqSum = 0 end
   statsDb.items = statsDb.items or {}
   return statsDb
 end
@@ -812,6 +850,7 @@ local function trackCraft(name, hash, count, info)
   craftSeq = craftSeq + 1
   crafts[#crafts+1] = {id=craftSeq, name=name, hash=hash, count=count, t=now(), state="START",
     label=info.label or shortName(name), source=info.source or "", stock=info.stock or 0}
+  logEvent("Craft gestartet: "..count.."x "..(info.label or shortName(name))..(info.source and info.source ~= "" and (" fuer "..info.source) or ""), "craft")
 end
 function updateCrafts(byName)
   local t, keep = now(), {}
@@ -827,6 +866,7 @@ function updateCrafts(byName)
         end
       elseif c.seen or (byName and stockOf(byName, c.name) > c.stock) then
         c.state, c.doneAt, c.stuck = "FERTIG", t, nil
+        logEvent("Craft fertig: "..c.count.."x "..c.label.." ("..fmtAge(t - c.t)..")", "craft")
       elseif S.cpuJobs and t - c.t > 90000 then
         c.state, c.doneAt = "FEHLER", t
         c.note = "nicht gestartet - Zutaten fehlen?"
@@ -861,6 +901,7 @@ function queueExport(e)
   if e.name and e.count and e.count > 0 then exportBuffer[#exportBuffer+1] = e end
 end
 function processExportBuffer(b)
+  local summary, total = {}, 0
   for _, it in ipairs(exportBuffer) do
     local side = it.side or cfg.exportSide
     local filter = {name=it.name, count=it.count, nbtHash=it.hash or ""}
@@ -869,6 +910,8 @@ function processExportBuffer(b)
     local entry = it.entry
     if ok and type(moved) == "number" and moved > 0 then
       statDelivered(it.name, it.label, moved)
+      total = total + moved
+      summary[#summary+1] = moved.."x "..(it.label or shortName(it.name))
       if it.reqId then sentAt[it.reqId] = now() end
       if it.key then
         local d = recentDelivery(it.key, it.cooldown or cfg.resendCooldown)
@@ -884,6 +927,11 @@ function processExportBuffer(b)
       addError("Export "..shortName(it.name)..": "..reason)
       if entry then entry.state = "FEHLER"; entry.note = reason end
     end
+  end
+  if #summary > 0 then
+    local more = #summary > 4 and (" +"..(#summary - 4).." weitere") or ""
+    while #summary > 4 do table.remove(summary) end
+    logEvent("Geliefert ("..total.."): "..table.concat(summary, ", ")..more, "lief")
   end
 end
 
@@ -1051,6 +1099,7 @@ local function handleGeneric(req, count, tpos, byName, b, entry)
   entry.note = prefix..(anyError and "Fehler, siehe Start" or ("x"..remaining.." kein Pattern"))
 end
 
+local reqMeta = {}   -- request id -> Anzeigename (fuer die Wartezeit-Statistik)
 function handleRequests(b, c, byName)
   local requests = call(c, "getRequests")
   if type(requests) ~= "table" then addError("getRequests fehlgeschlagen"); return end
@@ -1065,8 +1114,9 @@ function handleRequests(b, c, byName)
     end
     if it and it.name and count > 0 and not skipStates[req.state or ""] then
       local tpos = formatPos(req.target)
-      local entry = {state="?", count=count, label=asc(req.displayName or itemLabel(it)),
+      local entry = {state="?", count=count, label=asc(req.displayName or itemLabel(it)), item=it.name,
         target=targetName(req.target), tpos=tpos, note="", age=req.id and (t-firstSeen[req.id]) or 0}
+      if req.id then reqMeta[req.id] = entry.label end
       S.requests[#S.requests+1] = entry
       local last = req.id and sentAt[req.id]
       local pre = recentDelivery(deliveryKey(tpos, it.name, itemHash(it)), cfg.prestockCooldown)
@@ -1090,6 +1140,20 @@ function handleRequests(b, c, byName)
   end
   if oldCount > 0 then addAlert(oldCount.." Anfrage(n) offen seit > "..cfg.oldRequestMinutes.." min") end
   for id in pairs(sentAt) do if not activeIds[id] then sentAt[id] = nil end end
+  -- erledigte Anfragen: Wartezeit fuer die Statistik
+  local st = statsToday()
+  st.reqTimes = st.reqTimes or {}
+  for id, t0 in pairs(firstSeen) do
+    if not activeIds[id] and reqMeta[id] then
+      local d = t - t0
+      local label = reqMeta[id]
+      local e = st.reqTimes[label] or {n=0, sum=0, max=0}
+      e.n, e.sum, e.max = e.n + 1, e.sum + d, math.max(e.max, d)
+      st.reqTimes[label] = e
+      st.reqN, st.reqSum = (st.reqN or 0) + 1, (st.reqSum or 0) + d
+    end
+  end
+  for id in pairs(reqMeta) do if not activeIds[id] then reqMeta[id] = nil end end
   for id in pairs(firstSeen) do if not activeIds[id] then firstSeen[id] = nil; alertActive["old:"..tostring(id)] = nil end end
 end
 end -- anfragen
@@ -1178,6 +1242,7 @@ local function checkFinishedOrders(active)
         local text = isRemove and (o.name.." wurde abgerissen") or (o.name.." Stufe "..o.target.." ist fertig!")
         buildBanner = {t=now(), text=text}
         logLine("[BAU] "..text)
+        if not cfg.chatOnBuildDone then logEvent(text, "gut") end
         if cfg.chatOnBuildDone then chat(text) end
         knownOrders[id] = nil
       else
@@ -1188,11 +1253,13 @@ local function checkFinishedOrders(active)
   end
 end
 
+local orderSeen = {}   -- id -> erstmals gesehen
 function handleBuilds(b, c, byName)
   local orders = call(c, "getWorkOrders")
   if type(orders) ~= "table" then return end
   local active = {}
   local started = 0
+  local tNow = now()
   for _, wo in ipairs(orders) do
     if wo.id then
       knownOrders[tostring(wo.id)] = {name=asc(wo.displayName or "Bau"), target=tonumber(wo.targetLevel) or 0,
@@ -1210,7 +1277,13 @@ function handleBuilds(b, c, byName)
       end)() or nil,
       claimed = wo.isClaimed == true, pct = 0, res = {}, open = 0, missing = 0, pos = formatPos(wo.pos),
       builder = wo.builderHome and pretty(wo.builderHome.displayName or "Builder") or nil,
+      builderPos = wo.builderHome and wo.builderHome.pos and formatPos(wo.builderHome.pos) or nil,
+      wait = 0,
     }
+    if wo.id then
+      orderSeen[tostring(wo.id)] = orderSeen[tostring(wo.id)] or tNow
+      entry.wait = tNow - orderSeen[tostring(wo.id)]
+    end
     S.builds[#S.builds+1] = entry
     if wo.isClaimed and wo.builderHome and wo.id then
       local builderPos = formatPos(wo.builderHome.pos)
@@ -1282,6 +1355,7 @@ function handleBuilds(b, c, byName)
     end
   end
   checkFinishedOrders(active)
+  for id in pairs(orderSeen) do if not active[id] then orderSeen[id] = nil end end
   local changed = false
   for k in pairs(buildDb) do if not active[k] then buildDb[k] = nil; changed = true end end
   if changed then saveDb(cfg.buildsFile, buildDb) end
@@ -1376,11 +1450,12 @@ end
 -- UI
 -- =====================================================================
 local TABS = {
-  {id="start", label="Start", short="Home"}, {id="anfragen", label="Anfragen", short="Anfr"},
+  {id="start", label="Start", short="Home"}, {id="todo", label="Zu tun", short="Todo"},
+  {id="anfragen", label="Anfragen", short="Anfr"},
   {id="bau", label="Bau", short="Bau"}, {id="crafts", label="Crafts", short="Craft"},
   {id="buerger", label="Buerger", short="Buer"}, {id="kolonie", label="Kolonie", short="Kol"},
   {id="forschung", label="Forschung", short="Fors"}, {id="karte", label="Karte", short="Map"},
-  {id="stats", label="Stats", short="Stat"},
+  {id="stats", label="Stats", short="Stat"}, {id="log", label="Log", short="Log"},
   {id="optionen", label="Optionen", short="Opt"},
 }
 local stateStyle = {
@@ -1492,6 +1567,7 @@ end
 
 local renderers = {}
 local gotoTab   -- wird weiter unten gesetzt (setTab)
+local raidMode = false
 local function bannerRow(w)
   if buildBanner and now() - buildBanner.t < 600000 then
     local t = " * "..buildBanner.text.." * "
@@ -1773,10 +1849,64 @@ function renderers.anfragen(w)
   for _, e in ipairs(list) do rows[#rows+1] = requestRow(e, w) end
   return rows
 end
+do -- bauUI
+local function builderRows(w)
+  local rows = {}
+  local builders = {}
+  for _, b in ipairs(S.mapBuildings) do
+    if b.type:lower():gsub("^.*[:/]", "") == "builder" then builders[#builders+1] = {b=b, orders={}} end
+  end
+  if #builders == 0 then return rows end
+  local byPos = {}
+  for _, bl in ipairs(builders) do byPos[bl.b.key] = bl end
+  local waiting = {}
+  for _, e in ipairs(S.builds) do
+    if e.claimed and e.builderPos and byPos[e.builderPos] then table.insert(byPos[e.builderPos].orders, e)
+    elseif not e.claimed then waiting[#waiting+1] = e end
+  end
+  rows[#rows+1] = heading("Builder ("..#builders..")", w)
+  local free = {}
+  for i, bl in ipairs(builders) do
+    local b = bl.b
+    local label = fit("  "..b.name.." "..i.." (Lvl "..b.level..")", math.min(24, math.floor(w*0.45)))
+    if b.residents == 0 then
+      rows[#rows+1] = {seg(label), seg("kein Arbeiter zugewiesen", colors.orange)}
+    elseif #bl.orders == 0 then
+      free[#free+1] = b
+      rows[#rows+1] = {seg(label), seg("frei", colors.lime)}
+    else
+      local e = bl.orders[1]
+      local txt = e.name.." "..(e.approx and "ca." or "")..e.pct.."%"..(e.eta and (", ~"..fmtAge(e.eta)) or "")
+      rows[#rows+1] = {seg(label), seg(fit(txt, w - #label), colors.lightBlue)}
+    end
+  end
+  for _, e in ipairs(waiting) do
+    local warn = e.wait >= 600000
+    rows[#rows+1] = {seg(fit("  wartet: "..e.name.." Lvl "..e.targetLevel, math.min(30, math.floor(w*0.6))), warn and colors.orange or colors.white),
+      seg(" seit "..fmtAge(e.wait), warn and colors.orange or colors.gray)}
+  end
+  if #waiting > 0 then
+    local best
+    for _, b in ipairs(free) do if not best or b.level > best.level then best = b end end
+    local need = 0
+    for _, e in ipairs(waiting) do need = math.max(need, e.targetLevel) end
+    if best and best.level >= need then
+      rows[#rows+1] = textRow(fit("  Tipp: Builder frei - Auftrag in der Huette zuweisen", w), colors.yellow)
+    elseif best then
+      rows[#rows+1] = textRow(fit("  Tipp: freier Builder hat Stufe "..best.level..", Auftrag braucht "..need, w), colors.yellow)
+    elseif #free == 0 then
+      rows[#rows+1] = textRow(fit("  Alle Builder beschaeftigt", w), colors.gray)
+    end
+  end
+  return rows
+end
+
 function renderers.bau(w)
   local rows = {}
   local bn = bannerRow(w); if bn then rows[#rows+1] = bn end
+  for _, r in ipairs(builderRows(w)) do rows[#rows+1] = r end
   if #S.builds == 0 then rows[#rows+1] = textRow("Keine Bauauftraege.", colors.lime); return rows end
+  rows[#rows+1] = heading("Auftraege", w)
   for i, e in ipairs(S.builds) do
     if i > 1 then rows[#rows+1] = blank() end
     local lvl = e.targetLevel > 0 and (" Lvl "..e.level.."->"..e.targetLevel) or ""
@@ -1805,6 +1935,7 @@ function renderers.bau(w)
   if S.me and S.online == false then rows[#rows+1] = textRow("ME offline - keine Vorlieferung", colors.red) end
   return rows
 end
+end -- bauUI
 do -- buergerUI
 local citizenSel = nil   -- id des angetippten Buergers
 function renderers.buerger(w)
@@ -2066,6 +2197,29 @@ function renderers.stats(w)
     color=function(v) return (cfg.storageWarnPercent > 0 and v >= cfg.storageWarnPercent) and colors.red or colors.cyan end}))
   add(chartRows("Zufriedenheit (24h)", w, function(b) return b.happy end, {height=4, max=10,
     color=function(v) return v < cfg.chatHappinessBelow and colors.orange or colors.lime end}))
+  -- Liefer-Statistik
+  rows[#rows+1] = heading("Wartezeiten der Anfragen", w)
+  if (s.reqN or 0) > 0 then
+    rows[#rows+1] = {seg("  Heute "..s.reqN.." erledigt, im Schnitt ", colors.lightGray), seg(fmtAge(s.reqSum / s.reqN), colors.white), seg(" offen", colors.lightGray)}
+  else
+    rows[#rows+1] = textRow("  heute noch keine erledigten Anfragen", colors.gray)
+  end
+  local rt = {}
+  for label, e in pairs(s.reqTimes or {}) do rt[#rt+1] = {label=label, avg=e.sum / e.n, n=e.n, max=e.max} end
+  if #rt > 0 then
+    table.sort(rt, function(a, b) return a.avg > b.avg end)
+    rows[#rows+1] = textRow("  Am langsamsten (Schnitt / max / Anzahl):", colors.lightGray)
+    for i = 1, math.min(5, #rt) do
+      local e = rt[i]
+      rows[#rows+1] = {seg(fit("    "..e.label, w - 22)), seg(fit(fmtAge(e.avg), 7, true), e.avg >= 600000 and colors.orange or colors.white),
+        seg(fit(fmtAge(e.max), 7, true), colors.gray), seg(fit(e.n.."x", 6, true), colors.gray)}
+    end
+    table.sort(rt, function(a, b) return a.n > b.n end)
+    rows[#rows+1] = textRow("  Am haeufigsten angefragt:", colors.lightGray)
+    for i = 1, math.min(5, #rt) do
+      rows[#rows+1] = {seg(fit("    "..rt[i].label, w - 8)), seg(fit(rt[i].n.."x", 6, true), colors.lime)}
+    end
+  end
   rows[#rows+1] = heading("Meistgeliefert (gesamt)", w)
   local items = {}
   for name, e in pairs(s.items or {}) do items[#items+1] = {name=name, n=e.n, label=e.label} end
@@ -2088,6 +2242,108 @@ function renderers.stats(w)
   return rows
 end
 end -- diagramme
+
+-- ---------- Zu tun ----------
+function renderers.todo(w)
+  local rows = {}
+  -- 1) selbst craften / besorgen
+  local need, order = {}, {}
+  local function add(label, count, reason, source)
+    local e = need[label]
+    if not e then e = {label=label, count=0, reasons={}, sources={}}; need[label] = e; order[#order+1] = e end
+    e.count = e.count + (count or 0)
+    if reason and reason ~= "" then e.reasons[reason] = true end
+    if source and source ~= "" then e.sources[source] = true end
+  end
+  local function reasonOf(note)
+    note = note or ""
+    if note:find("Pattern") then return "kein Pattern" end
+    if note:find("Cutter") then return "Architect's Cutter" end
+    if note:find("Stufenlimit") then return "ueber Stufenlimit" end
+    if note:find("Zutaten") then return "Zutaten fehlen" end
+    return "fehlt"
+  end
+  for _, e in ipairs(S.requests) do
+    if e.state == "FEHLT" or e.state == "MANUELL" then add(e.label, e.count, reasonOf(e.note), e.target) end
+  end
+  for _, b in ipairs(S.builds) do
+    for _, r in ipairs(b.res) do if r.state == "FEHLT" then add(r.label, r.count, reasonOf(r.note), "Bau "..b.name) end end
+  end
+  for _, c in ipairs(crafts) do if c.state == "FEHLER" then add(c.label, c.count, "Zutaten fehlen", c.source) end end
+  rows[#rows+1] = heading("Selbst craften / besorgen ("..#order..")", w)
+  if #order == 0 then rows[#rows+1] = textRow("  Nichts - alles laeuft automatisch.", colors.lime) end
+  local wR = w >= 60 and 20 or 14
+  for _, e in ipairs(order) do
+    local reasons, sources = {}, {}
+    for r in pairs(e.reasons) do reasons[#reasons+1] = r end
+    for x in pairs(e.sources) do sources[#sources+1] = x end
+    table.sort(reasons); table.sort(sources)
+    local rc = reasons[1] == "kein Pattern" and colors.pink or colors.orange
+    rows[#rows+1] = {seg(fit(tostring(e.count), 6, true).." ", colors.white), seg(fit(e.label, w - 7 - wR - (w >= 60 and 16 or 0))),
+      seg(fit(table.concat(reasons, ", "), wR), rc), seg(w >= 60 and fit(" "..table.concat(sources, ", "), 16) or "", colors.gray)}
+  end
+  -- 2) Forschungskosten, die im ME fehlen
+  if research and #research.available > 0 then
+    local miss = {}
+    for _, it in ipairs(research.available) do
+      for _, c in ipairs(it.cost) do
+        local have = 0
+        for _, alt in ipairs(c.alts or {}) do have = have + stockOf(lastByName, alt.name) end
+        if have < c.count then miss[#miss+1] = {txt=(c.count - have).."x "..c.label, res=it.name} end
+      end
+    end
+    if #miss > 0 then
+      rows[#rows+1] = heading("Fuer Forschungen fehlt ("..#miss..")", w)
+      for _, m in ipairs(miss) do rows[#rows+1] = {seg(fit("  "..m.txt, math.floor(w*0.5))), seg(fit(" fuer "..m.res, w - math.floor(w*0.5)), colors.gray)} end
+    end
+  end
+  -- 3) Patterns, die sich lohnen
+  if cfg.trackMissingPatterns then
+    local now_ = now()
+    local list = {}
+    for name, e in pairs(missingDb) do
+      local label = asc(e.display or shortName(name))
+      local current = need[label] ~= nil
+      list[#list+1] = {label=label, count=e.count, last=e.last, current=current, score=e.count + (current and 100 or 0)}
+    end
+    table.sort(list, function(a, b) return a.score > b.score end)
+    rows[#rows+1] = heading("Pattern anlegen lohnt sich ("..#list..")", w)
+    if #list == 0 then rows[#rows+1] = textRow("  keine fehlenden Patterns bekannt", colors.lime) end
+    for i = 1, math.min(15, #list) do
+      local e = list[i]
+      rows[#rows+1] = {seg(e.current and " JETZT " or "       ", colors.black, e.current and colors.pink or nil),
+        seg(fit(" "..e.label, w - 33)), seg(fit(e.count.."x angefragt", 14, true), colors.lightGray),
+        seg(fit(e.last and (" vor "..fmtAge(now_ - e.last)) or "", 12), colors.gray)}
+    end
+    rows[#rows+1] = textRow(fit("Patterns im Pattern Encoding Terminal anlegen (AP kann das nicht).", w), colors.gray)
+  end
+  return rows
+end
+
+-- ---------- Ereignis-Log ----------
+do -- logUI
+local logFilter = "alle"
+function renderers.log(w)
+  local rows = {}
+  local kindStyle = {warn={colors.red, "!"}, gut={colors.lime, "+"}, update={colors.yellow, "U"},
+    craft={colors.green, "C"}, lief={colors.lightBlue, ">"}, info={colors.white, "-"}}
+  local head = {seg("Filter: ", colors.lightGray), seg("["..(logFilter == "alle" and "Alle" or "Wichtig").."]", colors.cyan),
+    seg("  (antippen zum Umschalten)  "..#eventLog.." Eintraege", colors.gray)}
+  head.action = function() logFilter = logFilter == "alle" and "wichtig" or "alle" end
+  rows[#rows+1] = head
+  local today = os.date("%d.%m")
+  for _, e in ipairs(eventLog) do
+    if logFilter == "alle" or e.k == "warn" or e.k == "gut" or e.k == "update" then
+      local st = kindStyle[e.k] or kindStyle.info
+      local d = os.date("%d.%m", e.t / 1000)
+      local tm = (d == today and "" or (d.." "))..os.date("%H:%M", e.t / 1000)
+      rows[#rows+1] = {seg(fit(tm, d == today and 6 or 12), colors.gray), seg(st[2].." ", st[1]), seg(fit(e.x, w - (d == today and 8 or 14)), e.k == "warn" and colors.orange or colors.white)}
+    end
+  end
+  if #eventLog == 0 then rows[#rows+1] = textRow("Noch keine Ereignisse.", colors.gray) end
+  return rows
+end
+end -- logUI
 
 -- ---------- Forschung ----------
 function renderers.forschung(w)
@@ -2153,7 +2409,7 @@ local function abbrOf(b)
   return typeAbbr[t] or (b.name:gsub("[^%a]", ""):sub(1, 2))
 end
 local function buildingStatus(b, probs)
-  if mapMode == "verteidigung" then
+  if mapMode == "verteidigung" or raidMode then
     local t = b.type:lower()
     if t:find("guard") or t:find("barrack") then return colors.lightBlue, "Wachgebaeude" end
     if not b.built then return colors.gray, "nicht gebaut" end
@@ -2172,7 +2428,14 @@ function renderers.karte(w, v)
   local list = S.mapBuildings
   if #list == 0 then rows[1] = textRow("Keine Gebaeudedaten.", colors.gray); return rows end
   local _, h = v.dev.getSize()
-  local H = math.max(4, h - 4 - 2)   -- Platz fuer Info- und Legendenzeile
+  local H = math.max(4, h - 4 - 2 - (raidMode and 1 or 0))   -- Platz fuer Info- und Legendenzeile
+  if raidMode then
+    local hpSum, n = 0, 0
+    for _, g in ipairs(S.guards) do if g.health and g.maxHealth and g.maxHealth > 0 then hpSum = hpSum + g.health / g.maxHealth; n = n + 1 end end
+    local col = S.colony or {}
+    rows[#rows+1] = {seg(fit(" "..(col.raid and "RAID" or "ANGRIFF").."!  Wachen "..#S.guards..(n > 0 and string.format(", HP %d%%", math.floor(hpSum / n * 100)) or "")
+      .."  Graeber "..tostring(col.graves or 0), w), colors.white, colors.red)}
+  end
   local probs = {}
   for _, e in ipairs(S.requests) do
     if e.tpos and (e.state == "FEHLT" or e.state == "FEHLER" or e.state == "MANUELL") then probs[e.tpos] = (probs[e.tpos] or 0) + 1 end
@@ -2269,7 +2532,7 @@ function renderers.karte(w, v)
   end
   rows[#rows+1] = info or {seg("Gebaeude antippen fuer Details", colors.gray)}
   local legend
-  if mapMode == "verteidigung" then
+  if mapMode == "verteidigung" or raidMode then
     legend = {seg(" ", colors.black, colors.green, "G"), seg(" geschuetzt "), seg(" ", colors.black, colors.red, "R"), seg(" ungeschuetzt "),
       seg(" ", colors.black, colors.lightBlue, "B"), seg(" Wache "), seg("[Status]", colors.cyan)}
   else
@@ -2307,6 +2570,9 @@ local SETTINGS = {
   {key="chatOnBuildDone", label="Bau fertig"},
   {key="chatOnResearch", label="Forschung fertig"},
   {key="chatOnFood", label="Essen wird knapp"},
+  {head="Raid-Modus"},
+  {key="raidSwitchMonitors", label="Monitore auf Verteidigung schalten"},
+  {key="raidScanInterval", label="Scan-Intervall im Raid (Sek.)", choices={2, 5, 10, 30}},
   {head="Updates"},
   {button="Pruefen", label="Jetzt suchen", run=function() updateCheckNow() end},
   {key="updateCheckHours", label="Automatisch suchen alle X Std. (0=aus)", choices={1, 3, 6, 12, 24, 0}},
@@ -2449,6 +2715,10 @@ local function drawView(v)
   for _, e in ipairs(S.requests) do if e.state == "FEHLT" or e.state == "FEHLER" or e.state == "MANUELL" then nReq = nReq + 1 end end
   if nReq > 0 then badge.anfragen = nReq end
   if #S.citizens > 0 then badge.buerger = #S.citizens end
+  local nTodo = 0
+  for _, e in ipairs(S.requests) do if e.state == "FEHLT" or e.state == "MANUELL" then nTodo = nTodo + 1 end end
+  for _, b in ipairs(S.builds) do nTodo = nTodo + (b.missing or 0) end
+  if nTodo > 0 then badge.todo = nTodo end
   local nCraft = 0
   for _, c in ipairs(crafts) do if c.state == "FEHLER" or (c.stuck and c.state == "LAEUFT") then nCraft = nCraft + 1 end end
   if nCraft > 0 then badge.crafts = nCraft end
@@ -2462,25 +2732,42 @@ local function drawView(v)
     function(i, tb) return " "..tb.short:sub(1, 3).." ", 0 end,
     function(i, tb) return " "..i.." ", 0 end,
   }
-  local texts, gap
-  for _, fn in ipairs(variants) do
-    texts, gap = {}, 0
-    local total = 0
-    for i, tb in ipairs(TABS) do local t2, g = fn(i, tb); texts[i] = t2; gap = g; total = total + #t2 + g end
-    if total <= w then break end
+  -- Reiter auf hoechstens maxRows Zeilen verteilen; nil wenn es nicht passt
+  local function layout(fn, maxRows)
+    local lines, cur, curW = {{}}, 1, 0
+    for i, tb in ipairs(TABS) do
+      local t2, g = fn(i, tb)
+      local gp = curW > 0 and g or 0
+      if curW + gp + #t2 > w then
+        if cur >= maxRows then return nil end
+        cur = cur + 1; lines[cur] = {}; curW = 0; gp = 0
+      end
+      table.insert(lines[cur], {tb=tb, t=t2, gap=gp})
+      curW = curW + gp + #t2
+    end
+    return lines
   end
-  local row, x = {}, 1
+  local lines
+  for _, fn in ipairs({variants[1], variants[2], variants[3], variants[4]}) do lines = layout(fn, 1); if lines then break end end
+  if not lines then
+    for _, fn in ipairs({variants[2], variants[3], variants[4], variants[5], variants[6], variants[7]}) do lines = layout(fn, 2); if lines then break end end
+  end
+  lines = lines or layout(variants[7], 3) or {{}}
   v.tabX = {}
-  for i, tb in ipairs(TABS) do
-    local active = tb.id == v.tab
-    row[#row+1] = seg(texts[i], active and colors.white or colors.lightGray, active and colors.blue or colors.gray)
-    v.tabX[#v.tabX+1] = {from=x, to=x+#texts[i]-1, id=tb.id}
-    x = x + #texts[i]
-    if gap > 0 then row[#row+1] = seg(" ", colors.black, colors.black); x = x + 1 end
+  for li, line in ipairs(lines) do
+    local row, x = {}, 1
+    for _, item in ipairs(line) do
+      if item.gap > 0 then row[#row+1] = seg(string.rep(" ", item.gap), colors.black, colors.black); x = x + item.gap end
+      local active = item.tb.id == v.tab
+      row[#row+1] = seg(item.t, active and colors.white or colors.lightGray, active and colors.blue or colors.gray)
+      v.tabX[#v.tabX+1] = {from=x, to=x+#item.t-1, id=item.tb.id, y=1+li}
+      x = x + #item.t
+    end
+    drawRow(win, 1 + li, w, row, color)
   end
-  drawRow(win, 2, w, row, color)
+  v.tabRows = #lines
   if not color then  -- s/w: aktiven Reiter mit Pfeil markieren
-    for _, tx in ipairs(v.tabX) do if tx.id == v.tab then win.setCursorPos(tx.from, 2); win.write(">") end end
+    for _, tx in ipairs(v.tabX) do if tx.id == v.tab then win.setCursorPos(tx.from, tx.y); win.write(">") end end
   end
 
   -- Inhalt
@@ -2489,7 +2776,7 @@ local function drawView(v)
     logLine("[ANZEIGE] "..v.tab..": "..tostring(rows))
     rows = {textRow(fit("Anzeigefehler im Reiter "..v.tab..":", w), colors.red), textRow(fit(tostring(rows), w), colors.red)}
   end
-  local top, bottom = 4, h-1
+  local top, bottom = math.max(4, 2 + (v.tabRows or 1) + 1), h-1
   local perPage = math.max(1, bottom-top+1)
   v.pages = math.max(1, math.ceil(#rows/perPage))
   if v.page > v.pages then v.page = v.pages end
@@ -2598,8 +2885,8 @@ local function onTouch(v, x, y)
   local _, h = v.dev.getSize()
   if y == 1 then
     if v.updX and x >= v.updX[1] and x <= v.updX[2] then setTab(v, "start") else os.queueEvent("ae2colony_refresh") end
-  elseif y == 2 then
-    for _, tx in ipairs(v.tabX or {}) do if x >= tx.from and x <= tx.to then setTab(v, tx.id); return end end
+  elseif y >= 2 and y <= 1 + (v.tabRows or 1) then
+    for _, tx in ipairs(v.tabX or {}) do if tx.y == y and x >= tx.from and x <= tx.to then setTab(v, tx.id); return end end
   elseif y == h then
     if v.nav and x >= v.nav.prev[1] and x <= v.nav.prev[2] then nextPage(v, -1)
     elseif v.nav and x >= v.nav.next[1] and x <= v.nav.next[2] then nextPage(v, 1)
@@ -2656,21 +2943,55 @@ syncMonitors()
 findChatBox()
 logLine(string.format("%s v%s gestartet - AP %s", scriptName, scriptVersion, apVersionText))
 
+-- Raid-Modus: Monitore auf Verteidigung, Redstone, schnellere Scans
+local updateRaid
+do -- raid
+local raidInfo = nil
+function updateRaid()
+  local col = S.colony or {}
+  local active = col.raid == true or col.attack == true
+  if active and not raidMode then
+    raidMode = true
+    raidInfo = {t=now(), graves=col.graves or 0}
+    if not cfg.chatOnAttack then logEvent(col.raid and "RAID gestartet!" or "Die Kolonie wird angegriffen!", "warn") end
+    if cfg.raidSwitchMonitors then
+      for _, v in pairs(views) do
+        if v.isMon then v.preRaidTab = v.tab; v.tab = "karte"; v.page = 1 end
+      end
+    end
+    if cfg.raidRedstoneSide ~= "" and redstone then pcall(redstone.setOutput, cfg.raidRedstoneSide, true) end
+  elseif not active and raidMode then
+    raidMode = false
+    local dead = math.max(0, (col.graves or 0) - (raidInfo and raidInfo.graves or 0))
+    local msg = "Raid vorbei nach "..fmtAge(now() - (raidInfo and raidInfo.t or now()))..(dead > 0 and (", "..dead.." Buerger gestorben") or ", keine Toten")
+    if cfg.chatOnAttack then chat(msg) else logEvent(msg, "gut") end
+    for _, v in pairs(views) do
+      if v.preRaidTab then v.tab = v.preRaidTab; v.preRaidTab = nil; v.page = 1 end
+    end
+    if cfg.raidRedstoneSide ~= "" and redstone then pcall(redstone.setOutput, cfg.raidRedstoneSide, false) end
+    raidInfo = nil
+  end
+end
+end -- raid
+
 local function scanLoop()
   while true do
     local ok, err = pcall(scan)
     if not ok then addError("Scan abgebrochen: "..tostring(err)) end
     local okU, errU = pcall(checkUpdate)
     if not okU then logLine("Update-Pruefung: "..tostring(errU)) end
+    local okR, errR = pcall(updateRaid)
+    if not okR then logLine("Raid-Modus: "..tostring(errR)) end
+    pcall(saveEvents)
     syncMonitors()
     drawAll()
-    scanTick = cfg.scanInterval
+    scanTick = raidMode and math.min(cfg.raidScanInterval, cfg.scanInterval) or cfg.scanInterval
     while scanTick > 0 do
       flushChat()
       local timer = os.startTimer(1)
       local event, arg
       repeat event, arg = os.pullEvent() until event == "ae2colony_refresh" or (event == "timer" and arg == timer)
-      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = math.min(scanTick - 1, cfg.scanInterval); drawAllFooters() end
+      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = math.min(scanTick - 1, raidMode and cfg.raidScanInterval or cfg.scanInterval); drawAllFooters() end
     end
   end
 end
@@ -2689,6 +3010,7 @@ while true do
     f.close()
   end)
   logLine("[ABSTURZ] "..msg)
+  pcall(logEvent, "Fehler abgefangen: "..msg, "warn"); pcall(saveEvents)
   addError("Fehler abgefangen (siehe "..CRASH_FILE.."): "..msg)
   pcall(chat, "Fehler im Programm abgefangen: "..msg)
   for _, v in pairs(views) do
