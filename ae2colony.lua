@@ -22,9 +22,13 @@
 --        * Stuendliche Update-Pruefung, "Jetzt pruefen" im Reiter Optionen
 -- v0.12: * Kachel-Uebersicht als Startseite auf grossen Monitoren (Kachel antippen = Reiter oeffnen)
 --        * Neuer Reiter "Karte": Draufsicht der Kolonie mit Gebaeude-Umrissen und Status-Farben
+-- v0.13: * Reiter "Forschung": laufende/verfuegbare Forschungen, Kosten im ME, Chat bei Abschluss
+--        * Buerger-Steckbrief (antippen) mit Skills und Job-Berater fuer Arbeitslose
+--        * Verteidigung: Wachen-Uebersicht, ungeschuetzte Gebaeude, Verteidigungs-Ansicht der Karte
+--        * Restzeit-Schaetzung fuer Baustellen, Essens-Vorrat mit Reichweite, Fertig-Meldung
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.12.0-ATM10"
+local scriptVersion = "0.13.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -79,7 +83,7 @@ return {
   mapShowCitizens = true,     -- Buerger als Punkte auf der Karte
   monitorScale = 0.5,         -- Textgroesse der Monitore (0.5 - 5)
   -- Start-Reiter je Monitor, z.B. { ["monitor_0"] = "start", ["monitor_1"] = "anfragen" }
-  -- Reiter: "start", "anfragen", "bau", "crafts", "buerger", "kolonie", "karte", "stats", "optionen"
+  -- Reiter: "start", "anfragen", "bau", "crafts", "buerger", "kolonie", "forschung", "karte", "stats", "optionen"
   -- Ohne Eintrag: 1. Monitor = start, 2. Monitor = anfragen
   monitorTabs = {},
 
@@ -89,6 +93,8 @@ return {
   oldRequestMinutes = 10,     -- Anfragen, die laenger offen sind, gelten als "haengend" (0 = aus)
   citizenHappinessBelow = 5,  -- Buerger unter dieser Zufriedenheit gelten als unzufrieden
   citizenHungerBelow = 4,     -- Buerger unter dieser Saettigung gelten als hungrig (max 20)
+  foodWarnHours = 6,          -- Warnung, wenn das Essen im ME voraussichtlich kuerzer reicht (0 = aus)
+  researchInterval = 300,     -- Sekunden zwischen zwei Abfragen der Forschung
 
   -- ===== Chat-Benachrichtigungen (nur wenn eine Chat Box angeschlossen ist) =====
   chatEnabled = true,
@@ -105,6 +111,9 @@ return {
   chatOnDisease = true,         -- Buerger ist krank geworden
   chatOnStuckCraft = true,      -- Craft haengt / konnte nicht starten
   chatOnVisitor = true,         -- neuer Besucher, dessen Anwerbekosten im ME liegen
+  chatOnBuildDone = true,       -- Bauauftrag fertig
+  chatOnResearch = true,        -- Forschung abgeschlossen
+  chatOnFood = true,            -- Essens-Vorrat reicht nicht mehr lange
 
   -- ===== Dateien & Statistik =====
   trackMissingPatterns = true,
@@ -267,6 +276,7 @@ local function newState()
   return {
     requests = {}, builds = {}, citizens = {}, citizenCount = 0,
     buildingsWorking = {}, buildingsUpgrade = {}, visitors = {}, mapBuildings = {}, citizenPos = {},
+    allCitizens = {}, guards = {}, food = nil,
     alerts = {}, errors = {}, colony = {}, me = {}, online = false, meStatus = "...",
     cpus = nil, freeCpus = nil, cpuJobs = nil,
   }
@@ -450,7 +460,8 @@ local function readBuildings(c)
       end
       S.mapBuildings[#S.mapBuildings+1] = {key=formatPos(b.pos), name=name, type=tostring(b.type or ""),
         x1=x1, z1=z1, x2=x2, z2=z2, level=lvl, maxLevel=maxLvl, working=b.isWorking == true,
-        built=b.built ~= false and lvl > 0, residents=type(b.citizens) == "table" and #b.citizens or 0}
+        built=b.built ~= false and lvl > 0, residents=type(b.citizens) == "table" and #b.citizens or 0,
+        guarded=b.guarded == true}
     end
     if b.isWorking then
       S.buildingsWorking[#S.buildingsWorking+1] = {name=name, level=lvl}
@@ -463,6 +474,73 @@ end
 local function targetName(pos)
   local p = formatPos(pos)
   return buildingNames[p] or p
+end
+
+-- Jobs: Haupt- und Nebenskill (MineColonies), Gebaeude-Typ und Anzeigename
+local jobName
+local jobInfo = {
+  builder={"Adaptability", "Athletics", "builder", "Builder"},
+  deliveryman={"Agility", "Adaptability", "deliveryman", "Kurier"},
+  miner={"Strength", "Stamina", "miner", "Minenarbeiter"},
+  lumberjack={"Strength", "Focus", "lumberjack", "Holzfaeller"},
+  farmer={"Stamina", "Athletics", "farmer", "Bauer"},
+  fisherman={"Focus", "Agility", "fisherman", "Fischer"},
+  baker={"Knowledge", "Dexterity", "bakery", "Baecker"},
+  cook={"Adaptability", "Knowledge", "cook", "Koch"},
+  smelter={"Athletics", "Strength", "smeltery", "Schmelzer"},
+  stonemason={"Creativity", "Dexterity", "stonemason", "Steinmetz"},
+  sawmill={"Knowledge", "Dexterity", "sawmill", "Saegewerk"},
+  blacksmith={"Strength", "Focus", "blacksmith", "Schmied"},
+  shepherd={"Focus", "Strength", "shepherd", "Schaefer"},
+  cowboy={"Athletics", "Stamina", "cowboy", "Kuhhirte"},
+  swineherder={"Strength", "Athletics", "swineherder", "Schweinehirte"},
+  chickenherder={"Adaptability", "Agility", "chickenherder", "Huehnerhirte"},
+  rabbitherder={"Agility", "Athletics", "rabbithutch", "Kaninchenhirte"},
+  composter={"Stamina", "Athletics", "composter", "Kompostierer"},
+  florist={"Dexterity", "Agility", "florist", "Florist"},
+  crusher={"Stamina", "Strength", "crusher", "Brecher"},
+  sifter={"Focus", "Strength", "sifter", "Sieber"},
+  enchanter={"Mana", "Knowledge", "enchanter", "Verzauberer"},
+  glassblower={"Creativity", "Focus", "glassblower", "Glasblaeser"},
+  dyer={"Creativity", "Dexterity", "dyer", "Faerber"},
+  fletcher={"Dexterity", "Creativity", "fletcher", "Pfeilmacher"},
+  mechanic={"Knowledge", "Agility", "mechanic", "Mechaniker"},
+  planter={"Agility", "Dexterity", "plantation", "Plantage"},
+  concretemixer={"Stamina", "Dexterity", "concretemixer", "Betonmischer"},
+  beekeeper={"Dexterity", "Adaptability", "beekeeper", "Imker"},
+  healer={"Mana", "Knowledge", "hospital", "Heiler"},
+  researcher={"Knowledge", "Mana", "university", "Forscher"},
+  teacher={"Knowledge", "Mana", "school", "Lehrer"},
+  alchemist={"Dexterity", "Mana", "alchemist", "Alchemist"},
+  netherworker={"Adaptability", "Strength", "netherworker", "Netherarbeiter"},
+  knight={"Adaptability", "Stamina", "guardtower", "Ritter"},
+  ranger={"Agility", "Adaptability", "guardtower", "Bogenschuetze"},
+  druid={"Mana", "Focus", "guardtower", "Druide"},
+}
+local skillDe = {Athletics="Athletik", Dexterity="Geschick", Strength="Staerke", Agility="Beweglichk.", Stamina="Ausdauer",
+  Mana="Mana", Adaptability="Anpassung", Focus="Fokus", Creativity="Kreativitaet", Knowledge="Wissen", Intelligence="Intelligenz"}
+function jobName(id) local j = jobInfo[id]; return j and j[4] or pretty(id) end
+local function jobScore(c, id)
+  local j = jobInfo[id]; if not j then return nil end
+  return 2 * (c.skills[j[1]] or 0) + (c.skills[j[2]] or 0)
+end
+-- beste Jobs fuer einen Buerger; bevorzugt Jobs, deren Gebaeude es in der Kolonie gibt
+local function jobAdvice(c, n)
+  local present = {}
+  for _, b in ipairs(S.mapBuildings) do present[b.type:lower():gsub("^.*[:/]", "")] = true end
+  if present.barracks or present.barrackstower then present.guardtower = true end
+  local list, anyPresent = {}, next(present) ~= nil
+  for id, j in pairs(jobInfo) do
+    if not anyPresent or present[j[3]] then list[#list+1] = {id=id, score=jobScore(c, id)} end
+  end
+  table.sort(list, function(a, b) if a.score ~= b.score then return a.score > b.score end return a.id < b.id end)
+  local out = {}
+  for i = 1, math.min(n or 2, #list) do out[i] = list[i] end
+  return out
+end
+local function skillText(c, id)
+  local j = jobInfo[id]; if not j then return "" end
+  return (skillDe[j[1]] or j[1]).." "..(c.skills[j[1]] or 0)..", "..(skillDe[j[2]] or j[2]).." "..(c.skills[j[2]] or 0)
 end
 
 local diseaseSeen = {}
@@ -493,10 +571,23 @@ local function readCitizens(c)
       if ct.workBuilding == nil then add("arbeitslos", 1) end
     end
     if ct.happiness and ct.happiness < cfg.citizenHappinessBelow then add(string.format("unzufrieden %.1f", ct.happiness), 1) end
+    local jobId = ct.workBuilding and ct.workBuilding.job and tostring(ct.workBuilding.job):lower():gsub("^.*:", "") or nil
+    local job = jobId and jobName(jobId) or (ct.isChild and "Kind" or "-")
     if #issues > 0 then
-      local job = ct.workBuilding and ct.workBuilding.job and pretty(ct.workBuilding.job) or (ct.isChild and "Kind" or "-")
       S.citizens[#S.citizens+1] = {name=asc(ct.name), job=job, issues=table.concat(issues, ", "), severity=severity}
     end
+    local skills = {}
+    if type(ct.skills) == "table" then
+      for k, sv in pairs(ct.skills) do skills[tostring(k)] = type(sv) == "table" and tonumber(sv.level) or tonumber(sv) or 0 end
+    end
+    local c = {id=ct.id, name=asc(ct.name), jobId=jobId, job=job, isChild=ct.isChild == true,
+      happy=tonumber(ct.happiness), sat=tonumber(ct.saturation), health=tonumber(ct.health), maxHealth=tonumber(ct.maxHealth),
+      armor=tonumber(ct.armor), skills=skills, pos=ct.pos, state=ct.state and asc(ct.state) or nil,
+      home=ct.homeBuilding and pretty(ct.homeBuilding.displayName or ct.homeBuilding.type or "?") or nil,
+      work=ct.workBuilding and pretty(ct.workBuilding.displayName or ct.workBuilding.type or "?") or nil,
+      issues=table.concat(issues, ", "), severity=severity}
+    S.allCitizens[#S.allCitizens+1] = c
+    if jobId == "knight" or jobId == "ranger" or jobId == "druid" then S.guards[#S.guards+1] = c end
   end
   for k in pairs(diseaseSeen) do if not active[k] then diseaseSeen[k] = nil end end
   table.sort(S.citizens, function(a, b) if a.severity ~= b.severity then return a.severity > b.severity end return a.name < b.name end)
@@ -525,6 +616,91 @@ local function readVisitors(c, byName)
     end
   end
   for name in pairs(visitorNotified) do if not present[name] then visitorNotified[name] = nil end end
+end
+
+-- Essen im ME zaehlen (Tag c:foods bzw. Whitelist)
+local function isFood(it)
+  if cfg.whitelistItemName[it.name] then return true end
+  if type(it.tags) == "table" then
+    for k, v in pairs(it.tags) do
+      local tag = type(k) == "string" and k or (type(v) == "string" and v or "")
+      tag = tag:gsub("^#", "")
+      if tag == "c:foods" or tag:find("^c:foods/") then return true end
+    end
+  end
+  return false
+end
+local function readFood(byName)
+  local n = 0
+  for _, list in pairs(byName) do
+    for _, it in ipairs(list) do if isFood(it) then n = n + (tonumber(it.count) or 0) end end
+  end
+  histSample("food", n)
+  -- Verbrauch aus dem Verlauf der letzten 6 Stunden
+  local k, rate = hourKey(), nil
+  local h = historyDb.h or {}
+  for back = 6, 1, -1 do
+    local b = h[k - back]
+    if b and b.food then
+      if b.food > n then rate = (b.food - n) / back end
+      break
+    end
+  end
+  local eta = rate and rate > 0 and (n / rate) or nil   -- Stunden
+  local satSum, satN = 0, 0
+  for _, c in ipairs(S.allCitizens) do if c.sat then satSum = satSum + c.sat; satN = satN + 1 end end
+  S.food = {count=n, rate=rate, etaH=eta, avgSat=satN > 0 and satSum / satN or nil}
+  local low = cfg.foodWarnHours > 0 and eta and eta < cfg.foodWarnHours
+  if low then addAlert(string.format("Essen im ME reicht nur noch ca. %s", fmtAge(eta * 3600000))) end
+  if cfg.chatOnFood then alert("food", low, string.format("Essen wird knapp: %d im ME, reicht ca. %s", n, fmtAge((eta or 0) * 3600000))) end
+end
+
+-- Forschung (teure Abfrage -> nur alle researchInterval Sekunden)
+local research = nil      -- {running, available, done, total, branches}
+local researchStatus = {} -- id -> Status beim letzten Abruf
+local lastResearchT = nil
+local function readResearch(c)
+  if lastResearchT and now() - lastResearchT < cfg.researchInterval * 1000 then return end
+  lastResearchT = now()
+  local tree = call(c, "getResearches")
+  if type(tree) ~= "table" then return end
+  local r = {running={}, available={}, done=0, total=0, branches={}}
+  local function walk(branch, list, parentDone)
+    for _, it in ipairs(list or {}) do
+      local st = tostring(it.status or "NOT_STARTED")
+      local name = asc(it.displayName or it.id or "?")
+      local br = r.branches[branch]
+      r.total = r.total + 1; br.total = br.total + 1
+      if st == "FINISHED" then r.done = r.done + 1; br.done = br.done + 1 end
+      if st == "IN_PROGRESS" then
+        local req = tonumber(it.requiredTime) or 0
+        local pct = req > 0 and math.min(99, math.floor((tonumber(it.progress) or 0) / req * 100)) or nil
+        r.running[#r.running+1] = {name=name, branch=branch, pct=pct}
+      elseif st == "NOT_STARTED" and parentDone then
+        local ok = true
+        for _, q in ipairs(it.requirements or {}) do if q.fulfilled == false then ok = false end end
+        if ok then
+          local cost = {}
+          for _, cst in ipairs(it.cost or {}) do
+            local vi = type(cst.validItems) == "table" and cst.validItems[1] or nil
+            if vi then cost[#cost+1] = {name=vi.name, label=itemLabel(vi), count=tonumber(cst.count) or 1, alts=cst.validItems} end
+          end
+          r.available[#r.available+1] = {name=name, branch=branch, cost=cost}
+        end
+      end
+      local prev = researchStatus[it.id or name]
+      if prev == "IN_PROGRESS" and st == "FINISHED" and cfg.chatOnResearch then chat("Forschung abgeschlossen: "..name) end
+      researchStatus[it.id or name] = st
+      walk(branch, it.children, st == "FINISHED")
+    end
+  end
+  for branchId, list in pairs(tree) do
+    local branch = pretty(branchId)
+    r.branches[branch] = {done=0, total=0}
+    walk(branch, list, true)
+  end
+  table.sort(r.available, function(a, b) if a.branch ~= b.branch then return a.branch < b.branch end return a.name < b.name end)
+  research = r
 end
 
 local function readME(b)
@@ -888,6 +1064,7 @@ local stageNames = {
   CLEAR="Raeumen", BUILD_SOLID="Rohbau", WEAK_SOLID="Rohbau 2", CLEAR_WATER="Wasser entfernen",
   CLEAR_NON_SOLIDS="Aufraeumen", DECORATE="Deko", SPAWN="Abschluss", REMOVE="Abriss", REMOVE_WATER="Abriss",
 }
+local buildEta
 -- Fortschritt = Bereich der aktuellen Bauphase + Materialfortschritt innerhalb der Phase.
 -- So stimmt die Groessenordnung auch, wenn das Skript erst mitten im Bau startet.
 local stageRanges = {
@@ -901,6 +1078,22 @@ local function stageIndex(stage)
   for i, s in ipairs(buildStages) do if s == stage then return i, #buildStages end end
   for i, s in ipairs(removeStages) do if s == stage then return i, #removeStages end end
   return nil
+end
+
+-- Restzeit aus dem Fortschritt der letzten Stunde (Proben alle 2 Minuten)
+function buildEta(rec, pct)
+  local t = now()
+  rec.samples = rec.samples or {}
+  local last = rec.samples[#rec.samples]
+  if not last or t - last.t >= 120000 then
+    rec.samples[#rec.samples+1] = {t=t, p=pct}
+    while #rec.samples > 0 and t - rec.samples[1].t > 3600000 do table.remove(rec.samples, 1) end
+    saveDb(cfg.buildsFile, buildDb)
+  end
+  local first = rec.samples[1]
+  if not first or t - first.t < 300000 or pct <= first.p then return nil end
+  local rate = (pct - first.p) / (t - first.t)       -- Prozent pro ms
+  return (100 - pct) / rate
 end
 
 local function buildProgress(wo, res)
@@ -930,7 +1123,30 @@ local function buildProgress(wo, res)
   end
   local frac = rec.base > 0 and (rec.base-total)/rec.base or 0
   local pct = math.floor(range[1] + (range[2]-range[1])*math.max(0, math.min(1, frac)))
-  return math.max(0, math.min(99, pct)), rec.approx
+  pct = math.max(0, math.min(99, pct))
+  return pct, rec.approx, buildEta(rec, pct)
+end
+
+local knownOrders = {}   -- id -> {name, target, pos, type, missing = Scans seit dem Verschwinden}
+local buildBanner = nil  -- {t, text}
+local function checkFinishedOrders(active)
+  for id, o in pairs(knownOrders) do
+    if not active[id] then
+      local lvl
+      for _, b in ipairs(S.mapBuildings) do if b.key == o.pos then lvl = b.level end end
+      local isRemove = o.type and o.type:find("REMOVE")
+      if (lvl and lvl >= o.target and o.target > 0) or isRemove then
+        local text = isRemove and (o.name.." wurde abgerissen") or (o.name.." Stufe "..o.target.." ist fertig!")
+        buildBanner = {t=now(), text=text}
+        logLine("[BAU] "..text)
+        if cfg.chatOnBuildDone then chat(text) end
+        knownOrders[id] = nil
+      else
+        o.missing = (o.missing or 0) + 1
+        if o.missing >= 3 then knownOrders[id] = nil end   -- abgebrochen o.ae.
+      end
+    end
+  end
 end
 
 local function handleBuilds(b, c, byName)
@@ -938,6 +1154,12 @@ local function handleBuilds(b, c, byName)
   if type(orders) ~= "table" then return end
   local active = {}
   local started = 0
+  for _, wo in ipairs(orders) do
+    if wo.id then
+      knownOrders[tostring(wo.id)] = {name=asc(wo.displayName or "Bau"), target=tonumber(wo.targetLevel) or 0,
+        pos=formatPos(wo.pos), type=tostring(wo.type or "")}
+    end
+  end
   for _, wo in ipairs(orders) do
     active[tostring(wo.id)] = true
     local entry = {
@@ -955,7 +1177,7 @@ local function handleBuilds(b, c, byName)
       local builderPos = formatPos(wo.builderHome.pos)
       local res = call(c, "getWorkOrderResources", wo.id)
       if type(res) == "table" then
-        entry.pct, entry.approx = buildProgress(wo, res)
+        entry.pct, entry.approx, entry.eta = buildProgress(wo, res)
         local noPattern = 0
         for _, r in ipairs(res) do
           local it = r.item
@@ -1020,6 +1242,7 @@ local function handleBuilds(b, c, byName)
       end
     end
   end
+  checkFinishedOrders(active)
   local changed = false
   for k in pairs(buildDb) do if not active[k] then buildDb[k] = nil; changed = true end end
   if changed then saveDb(cfg.buildsFile, buildDb) end
@@ -1029,6 +1252,7 @@ end
 -- Scan
 -- =====================================================================
 local bridge, colony = nil, nil
+local lastByName = nil
 -- ---------- Update-Pruefung ----------
 local updateInfo, lastUpdateCheck = nil, nil
 local updateMsg = nil        -- {t, color, text} Rueckmeldung zum Update
@@ -1094,6 +1318,9 @@ local function scan()
   updateCrafts(byName)
   readVisitors(colony, byName)
   if not byName then return end
+  lastByName = byName
+  readFood(byName)
+  readResearch(colony)
   handleRequests(bridge, colony, byName)   -- Requests zuerst (Buerger warten bereits)
   handleBuilds(bridge, colony, byName)     -- danach Baumaterial mit dem restlichen Bestand
   processExportBuffer(bridge)
@@ -1108,7 +1335,8 @@ local TABS = {
   {id="start", label="Start", short="Home"}, {id="anfragen", label="Anfragen", short="Anfr"},
   {id="bau", label="Bau", short="Bau"}, {id="crafts", label="Crafts", short="Craft"},
   {id="buerger", label="Buerger", short="Buer"}, {id="kolonie", label="Kolonie", short="Kol"},
-  {id="karte", label="Karte", short="Map"}, {id="stats", label="Stats", short="Stat"},
+  {id="forschung", label="Forschung", short="Fors"}, {id="karte", label="Karte", short="Map"},
+  {id="stats", label="Stats", short="Stat"},
   {id="optionen", label="Optionen", short="Opt"},
 }
 local stateStyle = {
@@ -1220,6 +1448,16 @@ end
 
 local renderers = {}
 local gotoTab   -- wird weiter unten gesetzt (setTab)
+local function bannerRow(w)
+  if buildBanner and now() - buildBanner.t < 600000 then
+    local t = " * "..buildBanner.text.." * "
+    local pad = math.max(0, math.floor((w - #t) / 2))
+    local row = {seg(string.rep(" ", pad)..t..string.rep(" ", math.max(0, w - pad - #t)), colors.black, colors.lime)}
+    row.action = function() buildBanner = nil end
+    return row
+  end
+end
+local function etaText(e) return e.eta and ("fertig in ca. "..fmtAge(e.eta)) or nil end
 
 -- ---------- Kacheln ----------
 local function fitSegs(segs, width)
@@ -1328,6 +1566,7 @@ local function dashboardTiles(w, tw)
       local nw = math.min(12, math.floor((tw - 2) * 0.45))
       if e.claimed then
         bLines[#bLines+1] = {seg(fit(e.name, nw)), seg(" "), miniBar(e.pct, tw - 2 - nw, e.missing > 0 and colors.orange or colors.green)}
+        if e.eta and i == 1 and #S.builds <= 2 then bLines[#bLines+1] = {seg("  "..etaText(e), colors.lightGray)} end
       else
         bLines[#bLines+1] = {seg(fit(e.name, nw)), seg(" wartet auf Builder", colors.gray)}
       end
@@ -1375,7 +1614,14 @@ local function dashboardTiles(w, tw)
     if hungry > 0 then cz[#cz+1] = {seg(fit(tostring(hungry), 4, true), colors.orange), seg(" hungrig")} end
     if homeless > 0 then cz[#cz+1] = {seg(fit(tostring(homeless), 4, true), colors.orange), seg(" ohne Zuhause")} end
   end
-  tiles[#tiles+1] = {title="BUERGER", tab="buerger", state=sick > 0 and "bad" or (#S.citizens > 0 and "warn" or "ok"), lines=cz}
+  local foodLow = false
+  if S.food then
+    local f = S.food
+    foodLow = cfg.foodWarnHours > 0 and f.etaH and f.etaH < cfg.foodWarnHours
+    cz[#cz+1] = {seg("Essen ", colors.lightGray), seg(tostring(f.count), foodLow and colors.red or colors.white),
+      seg(f.etaH and ("  ~"..fmtAge(f.etaH * 3600000)) or "  stabil", foodLow and colors.red or colors.lightGray)}
+  end
+  tiles[#tiles+1] = {title="BUERGER", tab="buerger", state=(sick > 0 or foodLow) and "bad" or (#S.citizens > 0 and "warn" or "ok"), lines=cz}
   return tiles
 end
 
@@ -1394,6 +1640,7 @@ function renderers.start(w, v)
       rows[#rows+1] = row
     end
     if updateMsg and (updateMsg.t == math.huge or now() - updateMsg.t < 60000) then rows[#rows+1] = textRow(fit(updateMsg.text, w), updateMsg.color) end
+    local bn = bannerRow(w); if bn then rows[#rows+1] = bn end
     for _, r in ipairs(tileRows(w, dashboardTiles(w, tw), cols)) do rows[#rows+1] = r end
     for _, a in ipairs(S.alerts) do rows[#rows+1] = textRow(fit("! "..a, w), colors.red) end
     for _, e in ipairs(S.errors) do rows[#rows+1] = textRow(fit("x "..e, w), colors.red) end
@@ -1409,6 +1656,7 @@ function renderers.start(w, v)
     return rows
   end
   local rows = {}
+  local bn = bannerRow(w); if bn then rows[#rows+1] = bn end
   if cfg.showColonyStatus then rows[#rows+1] = colonyLine(w) end
   rows[#rows+1] = meLine(w)
   rows[#rows+1] = todayLine()
@@ -1481,6 +1729,7 @@ function renderers.anfragen(w)
 end
 function renderers.bau(w)
   local rows = {}
+  local bn = bannerRow(w); if bn then rows[#rows+1] = bn end
   if #S.builds == 0 then rows[#rows+1] = textRow("Keine Bauauftraege.", colors.lime); return rows end
   for i, e in ipairs(S.builds) do
     if i > 1 then rows[#rows+1] = blank() end
@@ -1489,6 +1738,9 @@ function renderers.bau(w)
       seg(e.stage and ("  ["..e.stage.."]") or "", colors.lightGray),
       seg(e.builder and ("  "..e.builder) or "", colors.gray)}
     rows[#rows+1] = buildBarRow({name="Fortschritt", pct=e.pct, approx=e.approx, claimed=e.claimed, missing=e.missing}, w)
+    if e.claimed then
+      rows[#rows+1] = textRow(fit("  "..(etaText(e) or "Restzeit: wird nach ein paar Minuten geschaetzt"), w), e.eta and colors.lightBlue or colors.gray)
+    end
     if e.claimed then
       if #e.res == 0 then
         rows[#rows+1] = textRow("  Material komplett beim Builder", colors.lime)
@@ -1507,18 +1759,89 @@ function renderers.bau(w)
   if S.me and S.online == false then rows[#rows+1] = textRow("ME offline - keine Vorlieferung", colors.red) end
   return rows
 end
+local citizenSel = nil   -- id des angetippten Buergers
 function renderers.buerger(w)
   local rows = {}
-  rows[#rows+1] = {seg(string.format("%d Buerger, %d mit Problemen", S.citizenCount, #S.citizens), colors.white)}
-  if #S.citizens == 0 then rows[#rows+1] = blank(); rows[#rows+1] = textRow("Alle Buerger in Ordnung.", colors.lime); return rows end
+  local f = S.food
+  local head = {seg(string.format("%d Buerger, %d mit Problemen", S.citizenCount, #S.citizens), colors.white)}
+  if f then
+    local low = cfg.foodWarnHours > 0 and f.etaH and f.etaH < cfg.foodWarnHours
+    head[#head+1] = seg("   Essen im ME: "..f.count, low and colors.red or colors.lightGray)
+    head[#head+1] = seg(f.etaH and (" (~"..fmtAge(f.etaH * 3600000)..")") or " (stabil)", low and colors.red or colors.gray)
+  end
+  rows[#rows+1] = head
+  if f and f.avgSat then rows[#rows+1] = textRow(string.format("Durchschnittliche Saettigung %.1f/20", f.avgSat), f.avgSat < cfg.citizenHungerBelow * 2 and colors.orange or colors.gray) end
+
+  -- Steckbrief
+  local sel
+  for _, c in ipairs(S.allCitizens) do if c.id == citizenSel then sel = c end end
+  if sel then
+    local r1 = {seg(fit(sel.name.."  -  "..sel.job, w - 4), colors.yellow), seg("[x]", colors.red)}
+    r1.action = function() citizenSel = nil end
+    rows[#rows+1] = heading("Steckbrief", w)
+    rows[#rows+1] = r1
+    local hp = sel.health and sel.maxHealth and string.format("%d/%d", math.floor(sel.health), math.floor(sel.maxHealth)) or "-"
+    rows[#rows+1] = {seg("Zufr ", colors.lightGray), seg(sel.happy and string.format("%.1f", sel.happy) or "-"),
+      seg("  Saett ", colors.lightGray), seg(sel.sat and string.format("%.0f/20", sel.sat) or "-"),
+      seg("  HP ", colors.lightGray), seg(hp), seg("  Ruest ", colors.lightGray), seg(sel.armor and tostring(math.floor(sel.armor)) or "-")}
+    if sel.state then rows[#rows+1] = {seg("Status ", colors.lightGray), seg(fit(sel.state, w - 7))} end
+    rows[#rows+1] = {seg("Wohnt ", colors.lightGray), seg(fit(sel.home or "-", math.floor((w-12)/2))), seg(" Arbeit ", colors.lightGray), seg(fit(sel.work or "-", math.floor((w-12)/2)))}
+    if type(sel.pos) == "table" and sel.pos.x then rows[#rows+1] = {seg("Ort ", colors.lightGray), seg(formatPos(sel.pos))} end
+    -- Skills, beste zuerst, zwei Spalten
+    local sk = {}
+    for k, v in pairs(sel.skills) do sk[#sk+1] = {k=k, v=v} end
+    table.sort(sk, function(a, b) if a.v ~= b.v then return a.v > b.v end return a.k < b.k end)
+    local colW = math.floor(w / 2)
+    for i = 1, #sk, 2 do
+      local r = {}
+      for j = i, math.min(i + 1, #sk) do
+        r[#r+1] = seg(fit("  "..(skillDe[sk[j].k] or sk[j].k), colW - 4), colors.lightGray)
+        r[#r+1] = seg(fit(tostring(sk[j].v), 4, true), sk[j].v >= 20 and colors.lime or colors.white)
+      end
+      rows[#rows+1] = r
+    end
+    -- Job-Berater
+    local adv = jobAdvice(sel, 2)
+    if not sel.isChild and #adv > 0 then
+      local cur = sel.jobId and jobScore(sel, sel.jobId)
+      if cur and adv[1].id ~= sel.jobId and adv[1].score >= cur * 1.3 + 2 then
+        rows[#rows+1] = textRow(fit("Besser geeignet: "..jobName(adv[1].id).." ("..skillText(sel, adv[1].id)..")", w), colors.orange)
+      elseif cur then
+        rows[#rows+1] = textRow(fit("Passt gut zum Job ("..skillText(sel, sel.jobId)..")", w), colors.lime)
+      else
+        rows[#rows+1] = textRow(fit("Vorschlag: "..jobName(adv[1].id).." ("..skillText(sel, adv[1].id)..")", w), colors.lightBlue)
+      end
+    end
+  end
+
+  -- Arbeitslose mit Job-Vorschlag
+  local idle = {}
+  for _, c in ipairs(S.allCitizens) do if not c.jobId and not c.isChild then idle[#idle+1] = c end end
+  if #idle > 0 then
+    rows[#rows+1] = heading("Arbeitslos - Job-Vorschlag ("..#idle..")", w)
+    for _, c in ipairs(idle) do
+      local adv = jobAdvice(c, 2)
+      local txt = #adv > 0 and (jobName(adv[1].id)..(adv[2] and (" / "..jobName(adv[2].id)) or "")) or "-"
+      local r = {seg(fit(c.name, math.min(18, math.floor(w*0.35))), colors.white), seg(fit(" "..txt, w - math.min(18, math.floor(w*0.35))), colors.lightBlue)}
+      r.action = function() citizenSel = c.id end
+      rows[#rows+1] = r
+    end
+  end
+
+  -- Alle Buerger (Probleme zuerst)
+  rows[#rows+1] = heading("Alle Buerger - antippen fuer Steckbrief", w)
+  local list = {}
+  for _, c in ipairs(S.allCitizens) do list[#list+1] = c end
+  table.sort(list, function(a, b) if a.severity ~= b.severity then return a.severity > b.severity end return a.name < b.name end)
   local sevColor = {colors.yellow, colors.orange, colors.red}
   local wName = math.min(18, math.floor(w*0.3))
-  local wJob = w >= 50 and 12 or 0
-  for _, ct in ipairs(S.citizens) do
-    local row = {seg(fit(ct.name, wName), colors.white)}
-    if wJob > 0 then row[#row+1] = seg(fit(ct.job, wJob), colors.gray) end
-    row[#row+1] = seg(fit(" "..ct.issues, w-wName-wJob), sevColor[ct.severity] or colors.white)
-    rows[#rows+1] = row
+  local wJob = w >= 50 and 14 or 0
+  for _, c in ipairs(list) do
+    local r = {seg(fit(c.name, wName), c.id == citizenSel and colors.yellow or colors.white)}
+    if wJob > 0 then r[#r+1] = seg(fit(c.job, wJob), colors.gray) end
+    r[#r+1] = seg(fit(" "..(c.issues ~= "" and c.issues or "ok"), w - wName - wJob), sevColor[c.severity] or colors.lime)
+    r.action = function() citizenSel = c.id end
+    rows[#rows+1] = r
   end
   return rows
 end
@@ -1535,6 +1858,26 @@ function renderers.kolonie(w)
   for _, b in ipairs(S.buildingsUpgrade) do
     rows[#rows+1] = {seg(fit("  "..b.name, w-14)), seg(fit("Lvl "..b.level.."/"..b.maxLevel, 10, true), colors.lightGray),
       seg(b.built and "" or " *", colors.orange)}
+  end
+  -- Verteidigung
+  local unguarded = {}
+  for _, b in ipairs(S.mapBuildings) do
+    local t = b.type:lower()
+    if b.built and not b.guarded and not t:find("guard") and not t:find("barrack") then unguarded[#unguarded+1] = b.name end
+  end
+  local kinds = {knight=0, ranger=0, druid=0}
+  for _, g in ipairs(S.guards) do kinds[g.jobId] = (kinds[g.jobId] or 0) + 1 end
+  rows[#rows+1] = heading("Verteidigung", w)
+  rows[#rows+1] = {seg("Wachen "..#S.guards, #S.guards > 0 and colors.white or colors.orange),
+    seg(string.format("  (Ritter %d, Bogen %d, Druiden %d)", kinds.knight, kinds.ranger, kinds.druid), colors.gray)}
+  rows[#rows+1] = {seg("Ungeschuetzt: ", colors.lightGray), seg(#unguarded == 0 and "keine Gebaeude" or (#unguarded.." Gebaeude"), #unguarded > 0 and colors.orange or colors.lime),
+    seg(#unguarded > 0 and "  (Karte: Ansicht Verteidigung)" or "", colors.gray)}
+  if #unguarded > 0 then rows[#rows+1] = textRow(fit("  "..table.concat(unguarded, ", "), w), colors.orange) end
+  for _, g in ipairs(S.guards) do
+    local hp = g.health and g.maxHealth and g.maxHealth > 0 and (g.health / g.maxHealth) or nil
+    rows[#rows+1] = {seg(fit("  "..g.name, math.min(20, math.floor(w*0.4)))), seg(fit(jobName(g.jobId), 14), colors.gray),
+      seg(fit(hp and string.format("HP %d%%", math.floor(hp*100)) or "HP -", 9), hp and hp < 0.5 and colors.red or colors.white),
+      seg(g.armor and ("Ruest "..math.floor(g.armor)) or "", (g.armor or 0) < 10 and colors.orange or colors.lightGray)}
   end
   rows[#rows+1] = heading("Besucher in der Taverne ("..#S.visitors..")", w)
   if #S.visitors == 0 then rows[#rows+1] = textRow("  keine", colors.gray) end
@@ -1696,8 +2039,54 @@ function renderers.stats(w)
   return rows
 end
 
+-- ---------- Forschung ----------
+function renderers.forschung(w)
+  local rows = {}
+  if not research then
+    rows[1] = textRow("Forschungsdaten werden geladen ...", colors.gray)
+    return rows
+  end
+  local r = research
+  rows[#rows+1] = {seg(string.format("%d von %d Forschungen abgeschlossen", r.done, r.total), colors.white),
+    seg(lastResearchT and ("   (Stand vor "..fmtAge(now() - lastResearchT)..")") or "", colors.gray)}
+  rows[#rows+1] = heading("Laeuft gerade ("..#r.running..")", w)
+  if #r.running == 0 then rows[#rows+1] = textRow("  nichts - in der Universitaet eine Forschung starten", colors.orange) end
+  local wName = math.min(28, math.floor(w * 0.45))
+  for _, it in ipairs(r.running) do
+    local f, rest = bar(it.pct or 0, math.max(4, w - wName - 17), colors.lightBlue)
+    rows[#rows+1] = {seg(fit("  "..it.name, wName)), seg(fit(it.branch, 9).." ", colors.gray), f, rest,
+      seg(fit(it.pct and (it.pct.."%") or "?", 5, true))}
+  end
+  rows[#rows+1] = heading("Kann gestartet werden ("..#r.available..")", w)
+  if #r.available == 0 then rows[#rows+1] = textRow("  keine (Gebaeude-Stufen fehlen?)", colors.gray) end
+  for _, it in ipairs(r.available) do
+    local parts, allOk = {}, true
+    for _, c in ipairs(it.cost) do
+      local have = 0
+      for _, alt in ipairs(c.alts or {}) do have = have + stockOf(lastByName, alt.name) end
+      if have < c.count then allOk = false end
+      parts[#parts+1] = c.count.."x "..c.label
+    end
+    local costText = #parts > 0 and table.concat(parts, ", ") or "keine Kosten"
+    rows[#rows+1] = {seg(fit("  "..it.name, wName), allOk and colors.lime or colors.white), seg(fit(it.branch, 9).." ", colors.gray),
+      seg(fit(costText, w - wName - 10), allOk and colors.lime or colors.orange)}
+  end
+  rows[#rows+1] = heading("Zweige", w)
+  local br = {}
+  for name, b in pairs(r.branches) do br[#br+1] = {name=name, b=b} end
+  table.sort(br, function(a, b) return a.name < b.name end)
+  for _, x in ipairs(br) do
+    local pct = x.b.total > 0 and x.b.done / x.b.total * 100 or 0
+    local f, rest = bar(pct, math.max(4, w - 30), colors.green)
+    rows[#rows+1] = {seg(fit("  "..x.name, 14)), f, rest, seg(fit(x.b.done.."/"..x.b.total, 9, true), colors.lightGray)}
+  end
+  rows[#rows+1] = textRow(fit("Gruen = Kosten liegen im ME", w), colors.gray)
+  return rows
+end
+
 -- ---------- Karte ----------
 local mapSel = nil   -- Schluessel des angetippten Gebaeudes
+local mapMode = "status"   -- "status" oder "verteidigung"
 local typeAbbr = {
   townhall="TH", warehouse="WH", builder="Bu", residence="Wo", citizen="Wo", cook="Re", restaurant="Re",
   farmer="Fa", fisherman="Fi", lumberjack="Ho", miner="Mi", guardtower="GT", barracks="Ka", barrackstower="KT",
@@ -1713,6 +2102,13 @@ local function abbrOf(b)
   return typeAbbr[t] or (b.name:gsub("[^%a]", ""):sub(1, 2))
 end
 local function buildingStatus(b, probs)
+  if mapMode == "verteidigung" then
+    local t = b.type:lower()
+    if t:find("guard") or t:find("barrack") then return colors.lightBlue, "Wachgebaeude" end
+    if not b.built then return colors.gray, "nicht gebaut" end
+    if b.guarded then return colors.green, "geschuetzt" end
+    return colors.red, "UNGESCHUETZT"
+  end
   if (probs[b.key] or 0) > 0 then return colors.red, "offene Anfragen" end
   if b.working then return colors.lightBlue, "im Bau" end
   if not b.built then return colors.gray, "nicht gebaut" end
@@ -1810,7 +2206,9 @@ function renderers.karte(w, v)
       if b.key == mapSel then
         local _, stText = buildingStatus(b, probs)
         local extra = ""
-        for _, e in ipairs(S.builds) do if e.pos == b.key and e.claimed then extra = "  "..(e.approx and "ca." or "")..e.pct.."%" end end
+        for _, e in ipairs(S.builds) do
+          if e.pos == b.key and e.claimed then extra = "  "..(e.approx and "ca." or "")..e.pct.."%"..(e.eta and (" ~"..fmtAge(e.eta)) or "") end
+        end
         info = {seg(b.name, colors.yellow), seg("  Lvl "..b.level.."/"..b.maxLevel, colors.white),
           seg("  "..stText..extra, colors.lightGray),
           seg((probs[b.key] or 0) > 0 and ("  "..probs[b.key].." Anfrage(n)") or "", colors.red),
@@ -1819,9 +2217,17 @@ function renderers.karte(w, v)
     end
   end
   rows[#rows+1] = info or {seg("Gebaeude antippen fuer Details", colors.gray)}
-  rows[#rows+1] = {seg(" ", colors.black, colors.green, "G"), seg(" Max "), seg(" ", colors.black, colors.yellow, "Y"), seg(" Ausbau "),
-    seg(" ", colors.black, colors.lightBlue, "B"), seg(" Bau "), seg(" ", colors.black, colors.red, "R"), seg(" Anfrage "),
-    seg(" ", colors.black, colors.gray, "-"), seg(" leer"), seg(cfg.mapShowCitizens and " \7 Buerger" or "", colors.lightGray)}
+  local legend
+  if mapMode == "verteidigung" then
+    legend = {seg(" ", colors.black, colors.green, "G"), seg(" geschuetzt "), seg(" ", colors.black, colors.red, "R"), seg(" ungeschuetzt "),
+      seg(" ", colors.black, colors.lightBlue, "B"), seg(" Wache "), seg("[Status]", colors.cyan)}
+  else
+    legend = {seg(" ", colors.black, colors.green, "G"), seg(" Max "), seg(" ", colors.black, colors.yellow, "Y"), seg(" Ausb "),
+      seg(" ", colors.black, colors.lightBlue, "B"), seg(" Bau "), seg(" ", colors.black, colors.red, "R"), seg(" Anfr "),
+      seg(" ", colors.black, colors.gray, "-"), seg(" leer "), seg("[Verteid.]", colors.cyan)}
+  end
+  legend.action = function() mapMode = mapMode == "status" and "verteidigung" or "status" end
+  rows[#rows+1] = legend
   return rows
 end
 
@@ -1846,6 +2252,9 @@ local SETTINGS = {
   {key="chatOnOldRequest", label="Haengende Anfragen"},
   {key="chatOnStuckCraft", label="Haengende Crafts"},
   {key="chatOnVisitor", label="Besucher anwerbbar"},
+  {key="chatOnBuildDone", label="Bau fertig"},
+  {key="chatOnResearch", label="Forschung fertig"},
+  {key="chatOnFood", label="Essen wird knapp"},
   {head="Updates"},
   {button="Pruefen", label="Jetzt suchen", run=function() updateCheckNow() end},
   {key="updateCheckHours", label="Automatisch suchen alle X Std. (0=aus)", choices={1, 3, 6, 12, 24, 0}},
@@ -1995,6 +2404,7 @@ local function drawView(v)
     function(i, tb) return " "..tb.label.." ", 0 end,
     function(i, tb) return " "..tb.short..(badge[tb.id] and "!" or "").." ", 0 end,
     function(i, tb) return " "..tb.short:sub(1, 3)..(badge[tb.id] and "!" or "").." ", 0 end,
+    function(i, tb) return " "..tb.short:sub(1, 3).." ", 0 end,
     function(i, tb) return " "..i.." ", 0 end,
   }
   local texts, gap
@@ -2164,7 +2574,8 @@ local function inputLoop()
         elseif a == keys.u and updateInfo then setTab(v, "start"); updateTap(); drawView(v) end
       end
     elseif ev == "char" and views.term then
-      local n = tonumber(a); if n and TABS[n] then setTab(views.term, TABS[n].id) end
+      local n = tonumber(a); if n == 0 then n = 10 end
+      if n and TABS[n] then setTab(views.term, TABS[n].id) end
     elseif ev == "monitor_resize" or ev == "term_resize" then
       drawAll()
     elseif ev == "peripheral" or ev == "peripheral_detach" then
