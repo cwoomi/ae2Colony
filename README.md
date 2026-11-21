@@ -24,6 +24,18 @@ Die Konfiguration (`ae2colony_config.lua`) und die Datenbanken bleiben erhalten.
 
 Einfacher geht es direkt am Monitor: Das Programm sucht jede Stunde nach Updates. Gibt es eins, steht **UPDATE VERFÜGBAR** in der Titelzeile, und auf der Startseite erscheint der Button **[ Jetzt updaten ]**. Zweimal antippen genügt, dann wird installiert und neu gestartet. Am Terminal geht das auch mit der Taste **U**. Im Reiter „Optionen“ kannst du außerdem sofort nach Updates suchen, das Intervall ändern oder automatische Updates einschalten.
 
+## Lager-Füllstand (MineColonies Warehouse)
+
+Das Programm zeigt, wie voll das Lager ist (Kachel „ME-Netz“, Reiter „Kolonie“, Verlauf unter „Stats“). Dafür muss es den **Lager-Hüttenblock** lesen können:
+
+- **Per Kabel:** Wired Modem an den Lager-Hüttenblock setzen und mit Netzwerkkabel an das Modem-Netz des Computers anschließen (Modem rechtsklicken, damit es rot leuchtet). Alternativ steht der Computer direkt am Hüttenblock.
+- **Per Funk:** Ein zweiter Computer steht direkt am Lager-Hüttenblock, und **beide** Computer bekommen ein Wireless- oder Ender-Modem. Auf dem zweiten Computer:
+  ```
+  wget https://raw.githubusercontent.com/cwoomi/ae2Colony/main/ae2colony_lager.lua startup.lua
+  reboot
+  ```
+  Der Sender funkt den Füllstand alle 20 Sekunden an das Hauptprogramm.
+
 ## Dateien
 
 | Datei | Zweck |
@@ -31,6 +43,7 @@ Einfacher geht es direkt am Monitor: Das Programm sucht jede Stunde nach Updates
 | `ae2colony.lua` | Hauptprogramm |
 | `update.lua` | Installer/Updater |
 | `ae2colony_debug.lua` | Diagnose (`ae2colony_debug upload`) |
+| `ae2colony_lager.lua` | Funk-Sender für den Lager-Füllstand (auf einem zweiten Computer) |
 
 ## Neue Version veröffentlichen
 

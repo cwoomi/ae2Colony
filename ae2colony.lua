@@ -35,9 +35,10 @@
 --        * Liefer-Statistik (Wartezeiten) und Builder-Auslastung
 -- v0.14.1: * Werkzeug-/Ruestungsanfragen zeigen, welche Items versucht wurden; Diagnose erweitert
 -- v0.14.2: * Fix: Crafts starteten nicht ("Zutaten fehlen"), wenn ein gebrauchtes Exemplar im ME lag
+-- v0.15: * Lager-Fuellstand (MineColonies Warehouse): direkt per Wired Modem oder per Funk-Sender
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.14.2-ATM10"
+local scriptVersion = "0.15.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -98,6 +99,10 @@ return {
 
   -- ===== Warnungen =====
   storageWarnPercent = 90,    -- ME-Speicher: Warnung ab diesem Fuellstand (0 = aus)
+  warehouseWarnPercent = 90,  -- Lager (Warehouse): Warnung ab diesem Fuellstand (0 = aus)
+  -- Lager-Huettenblock als Peripheral (Wired Modem / direkt angrenzend). "" = automatisch suchen.
+  -- Ohne Kabel: Programm "ae2colony_lager" auf einem Computer am Lager, beide mit Wireless/Ender Modem.
+  warehousePeripheral = "",
   energyWarnPercent = 10,     -- ME-Energie: Warnung unter diesem Stand (0 = aus)
   oldRequestMinutes = 10,     -- Anfragen, die laenger offen sind, gelten als "haengend" (0 = aus)
   citizenHappinessBelow = 5,  -- Buerger unter dieser Zufriedenheit gelten als unzufrieden
@@ -298,7 +303,7 @@ local function newState()
     buildingsWorking = {}, buildingsUpgrade = {}, visitors = {}, mapBuildings = {}, citizenPos = {},
     allCitizens = {}, guards = {}, food = nil,
     alerts = {}, errors = {}, colony = {}, me = {}, online = false, meStatus = "...",
-    cpus = nil, freeCpus = nil, cpuJobs = nil,
+    cpus = nil, freeCpus = nil, cpuJobs = nil, warehouse = nil,
   }
 end
 S = newState()
@@ -721,6 +726,63 @@ function readFood(byName)
   if cfg.chatOnFood then alert("food", low, string.format("Essen wird knapp: %d im ME, reicht ca. %s", n, fmtAge((eta or 0) * 3600000))) end
 end
 end -- essen
+
+-- Lager (MineColonies Warehouse): kombiniertes Inventar aller Racks
+local readWarehouse, lagerMessage
+do -- lager
+local remote, remoteT = nil, nil
+local function isWarehouse(name)
+  if name:lower():find("warehouse") then return true end
+  local types = {peripheral.getType(name)}
+  for _, t in ipairs(types) do if tostring(t):lower():find("warehouse") then return true end end
+  return false
+end
+local function findWarehouse()
+  if cfg.warehousePeripheral ~= "" then return peripheral.wrap(cfg.warehousePeripheral) end
+  if not peripheral.getNames then return nil end
+  for _, name in ipairs(peripheral.getNames()) do
+    if isWarehouse(name) then
+      local p = peripheral.wrap(name)
+      if p and p.list and p.size then return p end
+    end
+  end
+end
+function lagerMessage(msg)
+  if type(msg) == "table" and tonumber(msg.size) then remote, remoteT = msg, now() end
+end
+function readWarehouse()
+  local w
+  local p = findWarehouse()
+  if p then
+    local okS, size = pcall(p.size)
+    local okL, list = pcall(p.list)
+    if okS and okL and type(list) == "table" and tonumber(size) then
+      local used, total, by = 0, 0, {}
+      for _, it in pairs(list) do
+        local n = tonumber(it.count) or 0
+        used, total = used + 1, total + n
+        by[it.name] = (by[it.name] or 0) + n
+      end
+      local top, kinds = {}, 0
+      for nm, n in pairs(by) do top[#top+1] = {name=nm, n=n}; kinds = kinds + 1 end
+      table.sort(top, function(a, b) return a.n > b.n end)
+      while #top > 8 do table.remove(top) end
+      w = {size=tonumber(size), used=used, total=total, top=top, kinds=kinds, src="direkt"}
+    end
+  end
+  if not w and remote and now() - remoteT < math.max(120000, cfg.scanInterval * 3000) then
+    w = remote
+    w.src, w.age = "Funk", now() - remoteT
+  end
+  if not w then S.warehouse = {missing=true}; return end
+  w.pct = w.size > 0 and w.used / w.size * 100 or 0
+  S.warehouse = w
+  histSample("lager", w.pct)
+  local full = cfg.warehouseWarnPercent > 0 and w.pct >= cfg.warehouseWarnPercent
+  if full then addAlert(string.format("Lager (Warehouse) fast voll: %d%%", math.floor(w.pct))) end
+  if cfg.chatOnStorage then alert("lager", full, string.format("Lager (Warehouse) fast voll (%d%%)", math.floor(w.pct))) end
+end
+end -- lager
 
 -- Forschung (teure Abfrage -> nur alle researchInterval Sekunden)
 local research, lastResearchT, readResearch
@@ -1437,6 +1499,8 @@ local function scan()
   findChatBox()
   readColony(colony)
   histSample("happy", S.colony.happy)
+  local okW, errW = pcall(readWarehouse)
+  if not okW then logLine("Lager: "..tostring(errW)) end
   readBuildings(colony)
   readCitizens(colony)
   local online, status = bridgeStatus(bridge)
@@ -1674,6 +1738,12 @@ local function dashboardTiles(w, tw)
       {seg(fit("Verbrauch", 10), colors.lightGray), seg(type(me.usage) == "number" and string.format("%d/%d AE/t", math.floor(me.usage), math.floor(me.input or 0)) or "-",
         (type(me.usage) == "number" and type(me.input) == "number" and me.usage > me.input) and colors.orange or colors.white)},
     }
+    local wh = S.warehouse
+    if wh and not wh.missing then
+      local whFull = cfg.warehouseWarnPercent > 0 and wh.pct >= cfg.warehouseWarnPercent
+      meLines[#meLines+1] = {seg(fit("Lager", 10), colors.lightGray), miniBar(wh.pct, barW, whFull and colors.red or colors.brown)}
+      if whFull then full = true end
+    end
   else
     meLines = {{seg(S.meStatus or "offline", colors.red)}, {seg("Keine Lieferungen moeglich", colors.lightGray)}}
   end
@@ -2052,6 +2122,24 @@ function renderers.kolonie(w)
     rows[#rows+1] = {seg(fit("  "..b.name, w-14)), seg(fit("Lvl "..b.level.."/"..b.maxLevel, 10, true), colors.lightGray),
       seg(b.built and "" or " *", colors.orange)}
   end
+  -- Lager
+  local wh = S.warehouse
+  rows[#rows+1] = heading("Lager (Warehouse)", w)
+  if not wh or wh.missing then
+    rows[#rows+1] = textRow(fit("  Kein Zugriff auf das Lager. Entweder Wired Modem am Lager-", w), colors.gray)
+    rows[#rows+1] = textRow(fit("  Huettenblock anschliessen oder per Funk: ae2colony_lager", w), colors.gray)
+  else
+    local whFull = cfg.warehouseWarnPercent > 0 and wh.pct >= cfg.warehouseWarnPercent
+    local f, r = bar(wh.pct, math.max(4, w - 24), whFull and colors.red or colors.brown)
+    rows[#rows+1] = {seg(fit("  Belegt", 9), colors.lightGray), f, r, seg(fit(math.floor(wh.pct).."%", 5, true)),
+      seg(fit(" "..wh.used.."/"..wh.size, 10, true), colors.gray)}
+    rows[#rows+1] = {seg("  "..wh.total.." Items in "..(wh.kinds or "?").." Sorten, "..(wh.size - wh.used).." Slots frei", colors.white),
+      seg(wh.src == "Funk" and ("  (Funk, vor "..math.floor((wh.age or 0) / 1000).."s)") or "", colors.gray)}
+    for i, it in ipairs(wh.top or {}) do
+      if i > 5 then break end
+      rows[#rows+1] = {seg(fit(tostring(it.n), 9, true).."  ", colors.lightGray), seg(fit(asc(it.label or shortName(it.name)), w - 11))}
+    end
+  end
   -- Verteidigung
   local unguarded = {}
   for _, b in ipairs(S.mapBuildings) do
@@ -2209,6 +2297,8 @@ function renderers.stats(w)
   add(chartRows("Geliefert pro Stunde (24h)", w, function(b) return b.sent end, {height=5}))
   add(chartRows("ME-Speicher % (24h)", w, function(b) return b.storage end, {height=4, max=100,
     color=function(v) return (cfg.storageWarnPercent > 0 and v >= cfg.storageWarnPercent) and colors.red or colors.cyan end}))
+  add(chartRows("Lager-Fuellstand % (24h)", w, function(b) return b.lager end, {height=4, max=100,
+    color=function(v) return (cfg.warehouseWarnPercent > 0 and v >= cfg.warehouseWarnPercent) and colors.red or colors.brown end}))
   add(chartRows("Zufriedenheit (24h)", w, function(b) return b.happy end, {height=4, max=10,
     color=function(v) return v < cfg.chatHappinessBelow and colors.orange or colors.lime end}))
   -- Liefer-Statistik
@@ -2938,6 +3028,8 @@ function inputLoop()
     elseif ev == "char" and views.term then
       local n = tonumber(a); if n == 0 then n = 10 end
       if n and TABS[n] then setTab(views.term, TABS[n].id) end
+    elseif ev == "rednet_message" then
+      if c2 == "ae2colony_lager" then lagerMessage(b2) end
     elseif ev == "monitor_resize" or ev == "term_resize" then
       drawAll()
     elseif ev == "peripheral" or ev == "peripheral_detach" then
@@ -2953,6 +3045,12 @@ end -- eingabe
 cleanupOldLogs()
 bridge, colony = setupPeripherals()
 views.term = {dev=term.current(), name="term", tab="start", page=1, pages=1}
+-- Funk-Modems oeffnen (fuer den Lager-Sender)
+pcall(function()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" and peripheral.call(name, "isWireless") then rednet.open(name) end
+  end
+end)
 syncMonitors()
 findChatBox()
 logLine(string.format("%s v%s gestartet - AP %s", scriptName, scriptVersion, apVersionText))
