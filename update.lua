@@ -226,8 +226,8 @@ if hasStartup then
   if busy > 0 and autoYes then
     -- vom Programm aus gestartet: dessen eigene Crafts sind schon fertig; kurz auf den Rest warten
     say("Warte auf "..busy.." belegte Crafting-CPU(s) (max. 2 min) ...", colors.yellow)
-    local t0 = os.clock()
-    while busy > 0 and os.clock() - t0 < 120 do sleep(5); busy = busyCpus() end
+    local t0 = os.epoch("utc")
+    while busy > 0 and os.epoch("utc") - t0 < 120000 do sleep(5); busy = busyCpus() end
   elseif busy > 0 then
     say("Achtung: "..busy.." Crafting-CPU(s) sind belegt.", colors.yellow)
     say("Ein Neustart waehrend Crafts, die dieser Computer gestartet hat, kann mit", colors.yellow)

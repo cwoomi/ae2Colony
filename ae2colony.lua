@@ -43,9 +43,12 @@
 -- v0.16.2: * Crash-Schutz: Update/Neustart erst, wenn keine selbst gestarteten Crafts mehr laufen
 --            (AP 0.8.2a crasht den Server, wenn ein Craft fertig wird und der Computer neu gestartet wurde)
 --          * Notschalter "Auto-Crafting" (craftingEnabled), kleinere Baumaterial-Crafts
+-- v0.16.3: * Anzeige: "Scan laeuft" + Dauer, Countdown alle 10 s auch auf Monitoren,
+--            Monitore zeigen waehrend eines Scans den letzten vollstaendigen Stand
+--          * Weniger ME-Abfragen: Bestaende zwischengespeichert (Anfragen 15 s, Bau 2 min, Rest 10 min)
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.16.2-ATM10"
+local scriptVersion = "0.16.3-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -68,7 +71,7 @@ return {
   builderResourceInterval = 60, -- Sekunden: Materiallisten der Baustellen neu abfragen
   warehouseInterval = 60,     -- Sekunden: Lager-Fuellstand neu abfragen
   foodInterval = 300,         -- Sekunden: Essens-Vorrat im ME neu zaehlen
-  maxStockLookups = 100,      -- hoechstens so viele verschiedene Items pro Scan im ME nachschlagen
+  maxStockLookups = 40,       -- hoechstens so viele ME-Abfragen pro Scan (Rest kommt im naechsten Scan dran)
   resendCooldown = 300,       -- Sekunden Wartezeit nach einer Lieferung, bevor erneut geliefert wird
   craftingEnabled = true,     -- false = keine Crafts ueber die ME Bridge starten (nur ausliefern)
   craftMaxStack = false,      -- true = immer mindestens 64 Stueck craften
@@ -334,6 +337,7 @@ local sentAt     = {}   -- request id -> Zeitpunkt der letzten Lieferung
 local firstSeen  = {}   -- request id -> Zeitpunkt, an dem die Anfrage zuerst gesehen wurde
 local delivered  = {}   -- "zielPos|item|hash" -> {t=Zeitpunkt, n=Menge}
 local exportBuffer = {}
+local stockCache = {}   -- item -> {t, list}: zuletzt gelesener ME-Bestand (jede Abfrage geht das ganze ME durch)
 local updateWaiting = false   -- Update steht an: keine neuen Crafts, installieren sobald keine mehr laufen
 
 -- =====================================================================
@@ -869,22 +873,48 @@ end
 -- =====================================================================
 -- Nur die benoetigten Items nachschlagen. getItems() ohne Filter wandelt JEDES Item im ME
 -- (mit Komponenten, Tags, Hash) um und bremst bei grossen Systemen den Server aus.
-local function readStock(b, names)
+-- names: item -> maximales Alter des Bestands in Sekunden. Dringendes (Anfragen) zuerst,
+-- hoechstens maxStockLookups Abfragen pro Scan; der Rest nimmt den letzten bekannten Stand.
+local readStock
+do -- bestand
+local function copyList(list)
+  local out = {}
+  for i, it in ipairs(list) do local c = {}; for k, v in pairs(it) do c[k] = v end; out[i] = c end
+  return out
+end
+function readStock(b, names)
   local byName, asked, failed, lastErr = {}, 0, 0, nil
-  for name in pairs(names) do
-    asked = asked + 1
-    local ok, res, err = pcall(b.getItems, {name=name})
-    local list = {}
-    if ok and type(res) == "table" then
-      for _, it in ipairs(res) do if it.name == name then list[#list+1] = it end end
-    elseif not ok then
-      failed, lastErr = failed + 1, res
-    end
-    byName[name] = list
+  local t = now()
+  local todo = {}
+  for name, maxAge in pairs(names) do
+    local c = stockCache[name]
+    if c and t - c.t <= maxAge * 1000 then byName[name] = copyList(c.list)
+    else todo[#todo+1] = {name=name, age=maxAge} end
   end
+  table.sort(todo, function(a, b2) if a.age ~= b2.age then return a.age < b2.age end return a.name < b2.name end)
+  for i, e in ipairs(todo) do
+    local name = e.name
+    if i > cfg.maxStockLookups then
+      local c = stockCache[name]
+      byName[name] = c and copyList(c.list) or {}
+    else
+      asked = asked + 1
+      local ok, res = pcall(b.getItems, {name=name})
+      local list = {}
+      if ok and type(res) == "table" then
+        for _, it in ipairs(res) do if it.name == name then list[#list+1] = it end end
+      elseif not ok then
+        failed, lastErr = failed + 1, res
+      end
+      if ok then stockCache[name] = {t=t, list=list} end
+      byName[name] = copyList(list)
+    end
+  end
+  for name, c in pairs(stockCache) do if t - c.t > 1800000 then stockCache[name] = nil end end
   if asked > 0 and failed == asked then addError("ME getItems: "..tostring(lastErr)); return nil end
   return byName
 end
+end -- bestand
 local function findBridgeItem(byName, name, hash)
   for _, v in ipairs(byName[name] or {}) do
     if itemHash(v) == hash and (tonumber(v.count) or 0) > 0 then return v end
@@ -996,6 +1026,13 @@ function processExportBuffer(b)
     if ok and type(moved) == "number" and moved > 0 then
       statDelivered(it.name, it.label, moved)
       total = total + moved
+      local sc = stockCache[it.name]
+      if sc then
+        for _, e in ipairs(sc.list) do
+          if itemHash(e) == it.hash then e.count = math.max(0, (tonumber(e.count) or 0) - moved) end
+        end
+        if moved < it.count then sc.t = 0 end
+      end
       summary[#summary+1] = moved.."x "..(it.label or shortName(it.name))
       if it.reqId then sentAt[it.reqId] = now() end
       if it.key then
@@ -1618,16 +1655,20 @@ local function scan()
   readResearch(colony)
   local requests = call(colony, "getRequests")
   local orders, resources = readOrders(colony)
-  local names, count = {}, 0
+  local names = {}
+  local age = 15
   local function add(name)
-    if type(name) == "string" and not names[name] and count < cfg.maxStockLookups then names[name] = true; count = count + 1 end
+    if type(name) == "string" and (not names[name] or names[name] > age) then names[name] = age end
   end
-  requestItemNames(requests, add)
-  for _, res in pairs(resources) do
+  requestItemNames(requests, add)                  -- Anfragen: Bestand hoechstens 15 s alt
+  age = 60
+  for _, c in ipairs(crafts) do add(c.name) end    -- laufende Crafts (Fertig-Erkennung)
+  age = 120
+  for _, res in pairs(resources) do                -- Baumaterial
     for _, r in ipairs(type(res) == "table" and res or {}) do add(r.item and r.item.name) end
   end
+  age = 600
   for _, v in ipairs(type(visitors) == "table" and visitors or {}) do add(v.recruitCost and v.recruitCost.name) end
-  for _, c in ipairs(crafts) do add(c.name) end
   if research then
     for _, it in ipairs(research.available) do
       for _, c in ipairs(it.cost) do for i, alt in ipairs(c.alts or {}) do if i <= 3 then add(alt.name) end end end
@@ -2885,7 +2926,9 @@ end
 
 -- ---------- Zeichnen ----------
 local views = {}      -- name -> {dev, name, tab, page, pages, isMon, tabX, nav}
-local scanTick = cfg.scanInterval
+local scanTick = cfg.scanInterval   -- -1 = Scan laeuft gerade
+local lastScanMs = nil              -- Dauer des letzten Scans
+local shownS = nil                  -- letzter vollstaendiger Scan-Stand (fuer die Anzeige waehrend eines Scans)
 
 local function drawRow(t, y, w, row, color)
   t.setCursorPos(1, y); t.setBackgroundColor(colors.black); t.clearLine()
@@ -2913,16 +2956,30 @@ local function drawFooter(v)
   local color = t.isColor()
   local nav = string.format("[<] %d/%d [>]", v.page, v.pages)
   if v.pages <= 1 then nav = "" end
-  local scanText = " Scan "..scanTick.."s "
+  local scanText
+  if scanTick < 0 then scanText = " Scan laeuft... "
+  else
+    scanText = " Scan "..scanTick.."s "
+    if lastScanMs and lastScanMs >= 5000 then scanText = " (dauerte "..math.floor(lastScanMs / 1000).."s)"..scanText end
+  end
   local barW = math.max(0, w - #nav - #scanText - 1)
-  local filled = math.floor(scanTick/cfg.scanInterval*barW + 0.5)
+  local filled = math.max(0, math.min(barW, math.floor(math.max(0, scanTick)/cfg.scanInterval*barW + 0.5)))
   local row = {seg(nav, colors.lightGray), seg(" "), seg(string.rep(" ", filled), colors.white, colors.gray, "#"),
     seg(string.rep(" ", barW-filled), colors.white, colors.black, " "), seg(scanText, colors.gray)}
   drawRow(t, h, w, row, color)
   v.nav = (v.pages > 1) and {prev={1, 3}, next={#nav-2, #nav}} or nil
 end
 
+local drawViewInner
+-- Waehrend ein Scan laeuft, ist S halb gefuellt -> den letzten vollstaendigen Stand anzeigen
 local function drawView(v)
+  local live = S
+  if shownS then S = shownS end
+  local ok, err = pcall(drawViewInner, v)
+  S = live
+  if not ok then error(err, 0) end
+end
+function drawViewInner(v)
   local dev = v.dev
   local ok, w, h = pcall(dev.getSize)
   if not ok then return end
@@ -3040,7 +3097,9 @@ end
 local function drawAll() for _, v in pairs(views) do drawView(v) end end
 -- Sekunden-Countdown nur am Terminal: jedes Beschreiben eines Monitors laesst CC den Monitor-Block
 -- im naechsten Server-Tick neu synchronisieren - das sparen wir uns bei Monitoren
-local function drawAllFooters() if views.term then drawFooter(views.term) end end
+local function drawAllFooters(all)
+  for _, v in pairs(views) do if all or not v.isMon then drawFooter(v) end end
+end
 
 updateCheckNow = function()
   updateMsg = {t=now(), color=colors.lightGray, text="Suche nach Updates ..."}
@@ -3250,8 +3309,12 @@ end -- raid
 
 local function scanLoop()
   while true do
+    scanTick = -1
+    drawAllFooters(true)
+    local t0 = now()
     local ok, err = pcall(scan)
     if not ok then addError("Scan abgebrochen: "..tostring(err)) end
+    lastScanMs = now() - t0
     local okU, errU = pcall(checkUpdate)
     if not okU then logLine("Update-Pruefung: "..tostring(errU)) end
     local okR, errR = pcall(updateRaid)
@@ -3259,6 +3322,7 @@ local function scanLoop()
     local okP, errP = pcall(runPendingUpdate)
     if not okP then logLine("Update: "..tostring(errP)) end
     pcall(saveEvents)
+    shownS = S
     syncMonitors()
     drawAll()
     scanTick = raidMode and math.min(cfg.raidScanInterval, cfg.scanInterval) or cfg.scanInterval
@@ -3267,7 +3331,7 @@ local function scanLoop()
       local timer = os.startTimer(1)
       local event, arg
       repeat event, arg = os.pullEvent() until event == "ae2colony_refresh" or (event == "timer" and arg == timer)
-      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = math.min(scanTick - 1, raidMode and cfg.raidScanInterval or cfg.scanInterval); drawAllFooters() end
+      if event == "ae2colony_refresh" then scanTick = 0 else scanTick = math.min(scanTick - 1, raidMode and cfg.raidScanInterval or cfg.scanInterval); drawAllFooters(scanTick % 10 == 0) end
     end
   end
 end

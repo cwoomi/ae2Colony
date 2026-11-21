@@ -1,5 +1,12 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.16.3-ATM10
+  - Fix: Monitore wirkten eingefroren (seit 0.16.1 kein Countdown mehr, Scans auf vollen Servern langsam)
+    -> "Scan laeuft..." und Dauer des letzten Scans in der Fusszeile, Countdown alle 10 s auch auf Monitoren
+  - Waehrend eines Scans zeigen Monitore den letzten vollstaendigen Stand statt eines halb gefuellten
+  - Weniger ME-Abfragen: Bestaende zwischengespeichert (Anfragen 15 s, Crafts 1 min, Baumaterial 2 min,
+    Besucher/Forschung 10 min), max. 40 Abfragen pro Scan; Bestand wird nach Lieferungen nachgefuehrt
+  - update.lua: Wartezeit auf belegte CPUs richtig gemessen (max. 2 min)
 v0.16.2-ATM10
   - Crash-Schutz: Advanced Peripherals 0.8.2a crasht den Server, wenn ein ueber die ME Bridge gestarteter
     Craft fertig wird, nachdem der Computer neu gestartet wurde. Update-Button und Auto-Update warten daher,
