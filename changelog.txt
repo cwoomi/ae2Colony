@@ -1,5 +1,10 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.16.4-ATM10
+  - Craftbarkeit ueber AE2s Liste craftbarer Items (getCraftableItems) statt AP isCraftable, das nur Patterns
+    in Pattern Providern kennt -> Rezepte aus dem Advanced AE Quantum Crafter werden jetzt gecraftet
+  - Advanced AE Quantum Computer: legt CPUs erst pro Auftrag an (im Leerlauf keine sichtbar). Das Skript
+    erkennt das und begrenzt dann nicht mehr nach freien CPUs (Schalter "Freie CPUs pruefen" / cpuCheck)
 v0.16.3-ATM10
   - Fix: Monitore wirkten eingefroren (seit 0.16.1 kein Countdown mehr, Scans auf vollen Servern langsam)
     -> "Scan laeuft..." und Dauer des letzten Scans in der Fusszeile, Countdown alle 10 s auch auf Monitoren

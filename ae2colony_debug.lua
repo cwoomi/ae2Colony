@@ -109,7 +109,8 @@ else
         add("  Pruefung Vanilla-"..typ..":")
         for _, pre in ipairs({"wooden", "golden", "stone", "iron", "diamond", "netherite", "leather", "chainmail"}) do
           local name = "minecraft:"..pre.."_"..typ
-          local craftable = bcall("isCraftable", {name=name, count=1})
+          local cl = bcall("getCraftableItems", {name=name, nbtHash=""})
+          local craftable = type(cl) == "table" and #cl > 0 or bcall("isCraftable", {name=name, count=1})
           local crafting = bcall("isCrafting", {name=name})
           local stock = bcall("getItem", {name=name})
           if craftable == true or (type(stock) == "table" and (stock.count or 0) > 0) or crafting == true then

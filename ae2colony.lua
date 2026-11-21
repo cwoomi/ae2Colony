@@ -46,9 +46,13 @@
 -- v0.16.3: * Anzeige: "Scan laeuft" + Dauer, Countdown alle 10 s auch auf Monitoren,
 --            Monitore zeigen waehrend eines Scans den letzten vollstaendigen Stand
 --          * Weniger ME-Abfragen: Bestaende zwischengespeichert (Anfragen 15 s, Bau 2 min, Rest 10 min)
+-- v0.16.4: * Advanced AE Quantum Computer: CPUs entstehen erst pro Auftrag -> keine "alle CPUs belegt"-
+--            Sperre mehr (automatisch erkannt, Schalter cpuCheck)
+--          * Craftbarkeit ueber AE2s Liste craftbarer Items (getCraftableItems) statt isCraftable:
+--            erkennt auch Rezepte, die nicht in Pattern Providern liegen (z.B. Advanced AE Quantum Crafter)
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.16.3-ATM10"
+local scriptVersion = "0.16.4-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -102,6 +106,9 @@ return {
   -- Vorab-Crafting: fehlendes Baumaterial aller angenommenen Bauauftraege wird gecraftet,
   -- aber nur, solange genug Crafting-CPUs frei sind (Buerger-Anfragen haben Vorrang).
   craftReserveCpus = 1,       -- so viele CPUs bleiben fuer Buerger-Anfragen frei
+  -- false = freie CPUs nicht pruefen. Wird automatisch abgeschaltet, wenn CPUs dynamisch entstehen
+  -- (Advanced AE Quantum Computer: legt pro Auftrag eine eigene CPU an, im Leerlauf keine sichtbar).
+  cpuCheck = true,
   prestockMaxCraftsPerScan = 3, -- hoechstens so viele neue Baumaterial-Crafts pro Scan
   craftStuckMinutes = 15,     -- Crafts, die laenger laufen, gelten als "haengend" (0 = aus)
 
@@ -929,7 +936,11 @@ local function stockOf(byName, name)
 end
 
 -- Crafting-CPUs: Auslastung + was gerade gecraftet wird
-local function readCpus(b)
+local readCpus
+do -- cpus
+local cpuCountSeen = nil   -- Anzahl CPUs beim letzten Scan
+local dynamicCpus = false  -- CPU-Anzahl aendert sich -> Quantum Computer o.ae., freie CPUs nicht zaehlbar
+function readCpus(b)
   local cpus = call(b, "getCraftingCPUs")
   if type(cpus) ~= "table" then return end
   local pctBy = {}
@@ -951,8 +962,16 @@ local function readCpus(b)
     if e.busy and e.item then e.pct = pctBy[e.item]; jobs[e.item] = e end
     list[#list+1] = e
   end
-  S.cpus, S.freeCpus, S.cpuJobs = list, free, jobs
+  if cpuCountSeen and cpuCountSeen ~= #list and not dynamicCpus then
+    dynamicCpus = true
+    logEvent("Crafting-CPUs entstehen dynamisch (Quantum Computer?) - CPU-Pruefung aus", "info")
+  end
+  cpuCountSeen = #list
+  -- freeCpus = nil heisst: nicht begrenzen (tryCraft prueft dann keine Reserve)
+  local gate = cfg.cpuCheck and not dynamicCpus and #list > 0
+  S.cpus, S.freeCpus, S.cpuJobs, S.cpuDynamic = list, gate and free or nil, jobs, dynamicCpus or #list == 0
 end
+end -- cpus
 
 -- Vom Skript gestartete Crafts verfolgen
 local crafts = {}
@@ -1084,9 +1103,17 @@ function tryCraft(b, name, hash, count, quiet, info)
   if cc and now() - cc.t < (cc.v and 600000 or 120000) then
     craftable = cc.v
   else
-    local ok, res, err = pcall(b.isCraftable, filter)
+    -- AP isCraftable kennt nur Patterns in Pattern Providern. getCraftableItems fragt AE2s eigene
+    -- Liste aller craftbaren Items ab (z.B. auch Rezepte aus dem Advanced AE Quantum Crafter).
+    local ok, res, err
+    if b.getCraftableItems then
+      ok, res, err = pcall(b.getCraftableItems, {name=name, nbtHash=hash or ""})
+      if ok and type(res) == "table" then res = #res > 0 end
+    else
+      ok, res, err = pcall(b.isCraftable, filter)
+    end
     if not ok or res == nil then
-      local msg = "isCraftable "..shortName(name)..": "..tostring(ok and err or res)
+      local msg = "Craftbarkeit "..shortName(name)..": "..tostring(ok and err or res)
       if quiet then logLine(msg) else addError(msg) end
       return "error"
     end
@@ -1955,7 +1982,7 @@ local function dashboardTiles(w, tw)
   local cpuWarn = false
   if S.cpus then
     local free = 0; for _, c in ipairs(S.cpus) do if not c.busy then free = free + 1 end end
-    cpuWarn = free <= cfg.craftReserveCpus
+    cpuWarn = S.freeCpus ~= nil and free <= cfg.craftReserveCpus
     local r = {seg(fit("CPUs", 6), colors.lightGray)}
     for i, c in ipairs(S.cpus) do if i <= tw - 18 then r[#r+1] = seg(" ", colors.white, c.busy and colors.orange or colors.green, c.busy and "#" or ".") end end
     r[#r+1] = seg(" "..free.."/"..#S.cpus.." frei", free > 0 and colors.white or colors.orange)
@@ -2356,7 +2383,10 @@ function renderers.crafts(w)
     local busy = #S.cpus - (S.freeCpus or 0)
     local free = 0; for _, c in ipairs(S.cpus) do if not c.busy then free = free + 1 end end
     rows[#rows+1] = {seg(fit("CPUs", 9), colors.lightGray), seg(free.." von "..#S.cpus.." frei", free > cfg.craftReserveCpus and colors.lime or colors.orange),
-      seg("   Reserve fuer Anfragen: "..cfg.craftReserveCpus, colors.gray)}
+      seg(S.freeCpus and ("   Reserve fuer Anfragen: "..cfg.craftReserveCpus) or "   (keine CPU-Begrenzung)", colors.gray)}
+    if S.cpuDynamic then
+      rows[#rows+1] = textRow(fit("  CPUs entstehen pro Auftrag (z.B. Quantum Computer)", w), colors.lightBlue)
+    end
     local wBar = math.max(4, math.min(#S.cpus, w - 10))
     if #S.cpus > 0 and wBar >= #S.cpus then
       local r = {seg(fit("", 9))}
@@ -2824,6 +2854,7 @@ local SETTINGS = {
   {key="craftingEnabled", label="Auto-Crafting ueber ME Bridge"},
   {key="prestockCraft", label="Baumaterial vorab craften"},
   {key="craftReserveCpus", label="CPUs fuer Anfragen reservieren", choices={0, 1, 2, 3, 4}},
+  {key="cpuCheck", label="Freie CPUs pruefen (aus: Quantum Computer)"},
   {key="prestockMaxCraftsPerScan", label="Baumaterial-Crafts pro Scan", choices={1, 2, 3, 5, 10}},
   {key="craftMaxStack", label="Immer mind. 64 craften"},
   {key="maxToolTier", label="Werkzeuge bis Stufe", choices={"wood", "stone", "iron", "diamond", "netherite"}},
