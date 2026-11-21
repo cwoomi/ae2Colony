@@ -34,9 +34,10 @@
 --        * Reiter "Log": Ereignis-Protokoll (Lieferungen, Crafts, Bau, Raids, Fehler ...)
 --        * Liefer-Statistik (Wartezeiten) und Builder-Auslastung
 -- v0.14.1: * Werkzeug-/Ruestungsanfragen zeigen, welche Items versucht wurden; Diagnose erweitert
+-- v0.14.2: * Fix: Crafts starteten nicht ("Zutaten fehlen"), wenn ein gebrauchtes Exemplar im ME lag
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.14.1-ATM10"
+local scriptVersion = "0.14.2-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -942,7 +943,9 @@ function tryCraft(b, name, hash, count, quiet, info)
   info = info or {}
   if cfg.craftMaxStack then count = math.max(count, 64) end
   if count <= 0 then count = 1 end
-  local filter = {name=name, count=count}; if hash then filter.nbtHash = hash end
+  -- nbtHash "" = nur die normale Variante ohne Components. Sonst nimmt AP evtl. ein gebrauchtes/
+  -- verzaubertes Exemplar aus dem ME als Craft-Ziel, fuer das es kein Pattern gibt -> Craft startet nicht.
+  local filter = {name=name, count=count, nbtHash=hash or ""}
   local okR, running = pcall(b.isCrafting, {name=name, nbtHash=hash})
   if okR and running == true then clearMissing(name); return "running" end
   local ok, craftable, err = pcall(b.isCraftable, filter)

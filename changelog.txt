@@ -1,5 +1,8 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.14.2-ATM10
+  - Fix: Crafts (z.B. Werkzeuge) starteten nicht und meldeten "Zutaten fehlen", wenn ein gebrauchtes/verzaubertes
+    Exemplar im ME lag - AP hat dann diese Variante statt der normalen craften wollen
 v0.14.1-ATM10
   - Werkzeug-/Ruestungsanfragen: Hinweis zeigt die versuchten Items bzw. das eingestellte Stufenlimit
   - ae2colony_debug: listet alle Anfragen und prueft Craftbarkeit der Werkzeug-/Ruestungsstufen
