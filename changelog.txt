@@ -1,5 +1,12 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.16.1-ATM10
+  - Raid-Modus (schnelle Scans, Monitore umschalten) nur noch bei echtem Raid, nicht bei jedem Mob-Angriff;
+    Scan-Intervall im Raid 10 s statt 5 s
+  - Monitore bekommen keinen Sekunden-Countdown mehr (weniger Monitor-Updates fuer den Server)
+  - Neustart-Bremse nach Fehlern: 5 s, 30 s, 2 min, 5 min statt immer 5 s
+  - Keine Doppel-Crafts mehr, solange AE2 einen gestarteten Craft noch berechnet
+    (isCrafting liefert in AP 0.8.2a immer nil)
 v0.16.0-ATM10
   - Performance fuer grosse ME-Systeme: keine komplette ME-Liste mehr (getItems ohne Filter wandelte jedes
     Item um), stattdessen gezielte Abfragen nur der benoetigten Items (Test mit 5000 Sorten: 15018 -> 9)

@@ -38,9 +38,11 @@
 -- v0.15: * Lager-Fuellstand (MineColonies Warehouse): direkt per Wired Modem oder per Funk-Sender
 -- v0.16: * Performance: keine komplette ME-Liste mehr, nur gezielte Abfragen der benoetigten Items;
 --          Craft-Pruefungen zwischengespeichert; Kolonie-Daten, Lager und Essen seltener abgefragt
+-- v0.16.1: * Server-Schonung: Raid-Modus nur bei echtem Raid (nicht bei jedem Mob-Angriff),
+--            Monitore ohne Sekunden-Countdown, Neustart-Bremse nach Fehlern, keine Doppel-Crafts
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.16.0-ATM10"
+local scriptVersion = "0.16.1-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -154,7 +156,7 @@ return {
 
   -- ===== Raid-Modus =====
   raidSwitchMonitors = true,  -- bei Raid/Angriff alle Monitore auf die Verteidigungs-Karte schalten
-  raidScanInterval = 5,       -- Sekunden zwischen Scans waehrend eines Raids
+  raidScanInterval = 10,      -- Sekunden zwischen Scans waehrend eines Raids
   raidRedstoneSide = "",      -- Redstone-Signal waehrend eines Raids, z.B. "back" ("" = aus)
 
   -- ===== Optionen-Reiter =====
@@ -1026,6 +1028,12 @@ function tryCraft(b, name, hash, count, quiet, info)
   local running
   if S.cpuJobs then running = S.cpuJobs[name] ~= nil
   else local okR, r = pcall(b.isCrafting, {name=name, nbtHash=hash}); running = okR and r == true end
+  if not running then
+    -- eigene, noch nicht auf einer CPU sichtbare Crafts (AE2 rechnet noch) zaehlen auch als laufend
+    for _, c in ipairs(crafts) do
+      if c.name == name and (c.state == "START" or c.state == "LAEUFT") then running = true; break end
+    end
+  end
   if running then clearMissing(name); return "running" end
   -- Pattern vorhanden? -> zwischengespeichert (ja: 10 min, nein: 2 min)
   local ck = name.."|"..tostring(hash)
@@ -1580,7 +1588,7 @@ local function scan()
   findChatBox()
   readColony(colony)
   histSample("happy", S.colony.happy)
-  local raid = S.colony.raid or S.colony.attack
+  local raid = S.colony.raid
   if raid or due("colony", cfg.colonyInterval) then
     readBuildings(colony)
     readCitizens(colony)
@@ -3017,7 +3025,9 @@ local function syncMonitors()
   for name, v in pairs(views) do if v.isMon and not seen[name] then views[name] = nil end end
 end
 local function drawAll() for _, v in pairs(views) do drawView(v) end end
-local function drawAllFooters() for _, v in pairs(views) do drawFooter(v) end end
+-- Sekunden-Countdown nur am Terminal: jedes Beschreiben eines Monitors laesst CC den Monitor-Block
+-- im naechsten Server-Tick neu synchronisieren - das sparen wir uns bei Monitoren
+local function drawAllFooters() if views.term then drawFooter(views.term) end end
 
 updateCheckNow = function()
   updateMsg = {t=now(), color=colors.lightGray, text="Suche nach Updates ..."}
@@ -3167,7 +3177,8 @@ do -- raid
 local raidInfo = nil
 function updateRaid()
   local col = S.colony or {}
-  local active = col.raid == true or col.attack == true
+  -- nur echte Raids: "isUnderAttack" ist schon wahr, wenn irgendein Mob einen Buerger angreift
+  local active = col.raid == true
   if active and not raidMode then
     raidMode = true
     raidInfo = {t=now(), graves=col.graves or 0}
@@ -3214,14 +3225,20 @@ local function scanLoop()
   end
 end
 
--- Fehler abfangen statt abstuerzen: protokollieren, anzeigen, nach 5 s weiterlaufen.
+-- Fehler abfangen statt abstuerzen: protokollieren, anzeigen, mit wachsender Pause weiterlaufen
+-- (5 s, 30 s, 2 min, 5 min), damit ein wiederkehrender Fehler den Server nicht im Sekundentakt belastet.
 -- Strg+T (Terminated) beendet das Programm weiterhin.
 local CRASH_FILE = "ae2colony_crash.txt"
+local crashCount, lastCrash = 0, 0
+local backoff = {5, 30, 120, 300}
 while true do
   local ok, err = pcall(parallel.waitForAny, scanLoop, inputLoop)
   if ok then break end
   if err == "Terminated" then error(err, 0) end
   local msg = tostring(err)
+  if now() - lastCrash > 600000 then crashCount = 0 end   -- 10 min ohne Fehler: Zaehler zuruecksetzen
+  crashCount, lastCrash = crashCount + 1, now()
+  local pause = backoff[math.min(crashCount, #backoff)]
   pcall(function()
     local f = fs.open(CRASH_FILE, "a")
     f.writeLine("["..os.date("%Y-%m-%d %H:%M:%S").."] v"..scriptVersion..": "..msg)
@@ -3236,8 +3253,8 @@ while true do
       local w, h = v.dev.getSize()
       v.dev.setBackgroundColor(colors.black); v.dev.setTextColor(colors.red)
       v.dev.setCursorPos(1, h); v.dev.clearLine()
-      v.dev.write(("Fehler - Neustart in 5s: "..msg):sub(1, w))
+      v.dev.write(("Fehler - Neustart in "..pause.."s: "..msg):sub(1, w))
     end)
   end
-  sleep(5)
+  sleep(pause)
 end
