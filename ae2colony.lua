@@ -54,9 +54,10 @@
 --          nicht beliefert, wenn das Item im Lager liegt, und hoechstens 1x nach 30 min nachgeliefert;
 --          Vorlieferung pausiert ab 90 % Lager-Fuellstand, Mengen pro Lieferung/Scan begrenzt
 -- v0.18: * Pocket Computer: Status per Funk (ae2colony_pocket), Fernsteuerung mit Pocket-Code
+-- v0.18.1: * Pocket-Code auch auf der Startseite des Computer-Bildschirms, Taste O = Optionen
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.18.0-ATM10"
+local scriptVersion = "0.18.1-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -2131,6 +2132,10 @@ function renderers.start(w, v)
     return rows
   end
   local rows = {}
+  -- Pocket-Code nur am Computer-Bildschirm (nicht auf Monitoren, die jeder sieht)
+  if v and not v.isMon and cfg.pocketEnabled and cfg.pocketCode ~= "" then
+    rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket: Reiter Ctl)", w), colors.cyan)
+  end
   local bn = bannerRow(w); if bn then rows[#rows+1] = bn end
   if cfg.showColonyStatus then rows[#rows+1] = colonyLine(w) end
   rows[#rows+1] = meLine(w)
@@ -2174,6 +2179,7 @@ function renderers.start(w, v)
       sev > 0 and colors.orange or colors.yellow)
   end
   if not any then rows[#rows+1] = blank(); rows[#rows+1] = textRow("Alles erledigt.", colors.lime) end
+
   return rows
 end
 end -- kacheln
@@ -3008,7 +3014,7 @@ function renderers.optionen(w, v)
   rows[#rows+1] = textRow(locked and "Gesperrt (lockSettings) - aendern nur am Terminal" or "Antippen zum Umschalten. Wird sofort gespeichert.",
     locked and colors.orange or colors.lightGray)
   if v and not v.isMon and cfg.pocketCode ~= "" then
-    rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket im Reiter Ctl eingeben)", w), colors.cyan)
+    rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket: Reiter Ctl)", w), colors.cyan)
   end
   -- feste Zeile fuer Rueckmeldungen, damit sich die Zeilen beim Tippen nicht verschieben
   if settingsMsg and now() - settingsMsg.t < 10000 then rows[#rows+1] = textRow(fit(settingsMsg.text, w), settingsMsg.color)
@@ -3456,7 +3462,8 @@ function inputLoop()
       end
     elseif ev == "char" and views.term then
       local n = tonumber(a); if n == 0 then n = 10 end
-      if n and TABS[n] then setTab(views.term, TABS[n].id) end
+      if n and TABS[n] then setTab(views.term, TABS[n].id)
+      elseif a == "o" or a == "O" then setTab(views.term, "optionen") end
     elseif ev == "rednet_message" then
       if c2 == "ae2colony_lager" then lagerMessage(b2)
       elseif c2 == "ae2colony_cmd" then pocketCommand(a, b2) end

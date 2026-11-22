@@ -1,5 +1,8 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.18.1-ATM10
+  - Pocket-Code steht jetzt auch auf der Startseite des Computer-Bildschirms (nicht auf Monitoren)
+  - Taste O am Computer springt zum Reiter Optionen
 v0.18.0-ATM10
   - Pocket Computer: neues Programm ae2colony_pocket (Uebersicht, Probleme, Bau, Zu tun, Log, Steuerung)
   - Hauptprogramm sendet nach jedem Scan einen kompakten Status per Funk (pocketEnabled)
