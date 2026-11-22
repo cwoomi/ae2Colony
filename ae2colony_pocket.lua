@@ -8,8 +8,44 @@
 -- Bedienung: Reiter oben antippen (oder Pfeil links/rechts), scrollen mit Mausrad / Pfeil hoch/runter.
 -- Steuern (Reiter "Ctl") braucht den Pocket-Code, der am Hauptcomputer im Reiter Optionen steht.
 
+local VERSION = "1.1"
+local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/ae2colony_pocket.lua"
+local UPDATE_EVERY = 3600   -- Sekunden zwischen zwei Update-Pruefungen
 local STATUS_PROTO, CMD_PROTO, ACK_PROTO = "ae2colony_status", "ae2colony_cmd", "ae2colony_ack"
 local SETTINGS_FILE = ".ae2colony_pocket"
+
+-- ---------- Selbst-Update ----------
+-- Der Pocket startet keine Crafts, ein Neustart nach dem Update ist also gefahrlos.
+local function isNewer(a, b)
+  local x, y = {}, {}
+  for n in tostring(a):gmatch("%d+") do x[#x+1] = tonumber(n) end
+  for n in tostring(b):gmatch("%d+") do y[#y+1] = tonumber(n) end
+  for i = 1, math.max(#x, #y) do
+    if (x[i] or 0) ~= (y[i] or 0) then return (x[i] or 0) > (y[i] or 0) end
+  end
+  return false
+end
+-- Rueckgabe: Text fuer die Anzeige (bei Erfolg startet der Pocket neu)
+local function selfUpdate()
+  if not http then return "HTTP aus - kein Update moeglich" end
+  local ok, h = pcall(http.get, UPDATE_URL.."?t="..os.epoch("utc"), nil, true)
+  if not ok or not h then return "Update-Pruefung fehlgeschlagen" end
+  local body = h.readAll(); h.close()
+  local remote = body and body:match('local VERSION = "([^"]+)"')
+  if not remote then return "Update-Pruefung fehlgeschlagen" end
+  if not isNewer(remote, VERSION) then return "Pocket ist aktuell (v"..VERSION..")" end
+  if not load(body, "=pocket", "t", {}) then return "Neue Version fehlerhaft - nicht installiert" end
+  local path = shell and shell.getRunningProgram() or "startup.lua"
+  if path:sub(1, 4) == "rom/" then path = "startup.lua" end
+  local f = fs.open(path..".new", "w"); f.write(body); f.close()
+  if fs.exists(path) then fs.delete(path) end
+  fs.move(path..".new", path)
+  term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
+  print("Pocket aktualisiert auf v"..remote)
+  print("Neustart ...")
+  sleep(1)
+  os.reboot()
+end
 
 -- ---------- Modem ----------
 local modemSide
@@ -165,10 +201,12 @@ local function lines()
     end)
     add("")
     add("[ Jetzt scannen ]", colors.lime, function() send("refresh") end)
+    add("[ Pocket-Update suchen ]", colors.cyan, function() msg, msgT = selfUpdate(), (os.epoch("utc") / 1000) end)
     if data.update then
       add("[ Update "..tostring(data.update).." ]", colors.yellow, function() send("update") end)
     end
     add("")
+    add("Pocket v"..VERSION.."  Hauptprogramm v"..tostring(data.v or "?"), colors.gray)
     local labels = {craftingEnabled="Auto-Crafting", prestockEnabled="Vorlieferung", prestockCraft="Bau craften",
       autoUpdate="Auto-Update", chatEnabled="Chat", raidSwitchMonitors="Raid-Monitore"}
     local keys = {"craftingEnabled", "prestockEnabled", "prestockCraft", "chatEnabled", "raidSwitchMonitors", "autoUpdate"}
@@ -236,8 +274,10 @@ local function draw()
 end
 
 -- ---------- Ablauf ----------
+selfUpdate()                                   -- beim Start nach neuer Pocket-Version suchen
 rednet.broadcast({cmd="status"}, CMD_PROTO)   -- sofort Daten anfordern
 local timer = os.startTimer(1)
+local updateTimer = os.startTimer(UPDATE_EVERY)
 draw()
 while true do
   local ev, a, b, c = os.pullEvent()
@@ -250,6 +290,9 @@ while true do
       msg, msgT = tostring(b.msg), (os.epoch("utc") / 1000)
       draw()
     end
+  elseif ev == "timer" and a == updateTimer then
+    selfUpdate()
+    updateTimer = os.startTimer(UPDATE_EVERY)
   elseif ev == "timer" and a == timer then
     timer = os.startTimer(1)
     draw()
