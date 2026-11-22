@@ -24,6 +24,19 @@ Die Konfiguration (`ae2colony_config.lua`) und die Datenbanken bleiben erhalten.
 
 Einfacher geht es direkt am Monitor: Das Programm sucht jede Stunde nach Updates. Gibt es eins, steht **UPDATE VERFÜGBAR** in der Titelzeile, und auf der Startseite erscheint der Button **[ Jetzt updaten ]**. Zweimal antippen genügt, dann wird installiert und neu gestartet. Am Terminal geht das auch mit der Taste **U**. Im Reiter „Optionen“ kannst du außerdem sofort nach Updates suchen, das Intervall ändern oder automatische Updates einschalten.
 
+## Pocket Computer
+
+Status der Kolonie unterwegs ansehen und das Programm fernsteuern.
+
+- **Hardware:** Advanced Pocket Computer mit **Ender-Modem** (überall, auch dimensionsübergreifend) oder Wireless-Modem (nur in Reichweite). Der Hauptcomputer braucht ebenfalls ein Wireless- oder Ender-Modem.
+- **Installation auf dem Pocket:**
+  ```
+  wget https://raw.githubusercontent.com/cwoomi/ae2Colony/main/ae2colony_pocket.lua startup.lua
+  reboot
+  ```
+- **Reiter:** Hom (Übersicht), Prb (Probleme + Crafts), Bau, Tdo (Zu tun), Log, Ctl (Steuerung). Wechseln per Antippen oder Pfeil links/rechts, scrollen mit Mausrad oder Pfeil hoch/runter.
+- **Steuern** (Reiter Ctl: Scan starten, Update auslösen, Auto-Crafting, Vorlieferung usw.) braucht den **Pocket-Code**. Er steht am Hauptcomputer im Reiter **Optionen**, nur auf dem Computer-Bildschirm, nicht auf den Monitoren. Ansehen können alle Pockets in Reichweite, steuern nur, wer den Code kennt.
+
 ## Lager-Füllstand (MineColonies Warehouse)
 
 Das Programm zeigt, wie voll das Lager ist (Kachel „ME-Netz“, Reiter „Kolonie“, Verlauf unter „Stats“). Dafür muss es den **Lager-Hüttenblock** lesen können:
@@ -44,6 +57,7 @@ Das Programm zeigt, wie voll das Lager ist (Kachel „ME-Netz“, Reiter „Kolo
 | `update.lua` | Installer/Updater |
 | `ae2colony_debug.lua` | Diagnose (`ae2colony_debug upload`) |
 | `ae2colony_lager.lua` | Funk-Sender für den Lager-Füllstand (auf einem zweiten Computer) |
+| `ae2colony_pocket.lua` | Programm für den Pocket Computer |
 
 ## Neue Version veröffentlichen
 

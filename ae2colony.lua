@@ -53,9 +53,10 @@
 -- v0.17: * Kein Ueberliefern mehr: Vorlieferung merkt sich, was unterwegs/im Lager ist; Anfragen werden
 --          nicht beliefert, wenn das Item im Lager liegt, und hoechstens 1x nach 30 min nachgeliefert;
 --          Vorlieferung pausiert ab 90 % Lager-Fuellstand, Mengen pro Lieferung/Scan begrenzt
+-- v0.18: * Pocket Computer: Status per Funk (ae2colony_pocket), Fernsteuerung mit Pocket-Code
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.17.0-ATM10"
+local scriptVersion = "0.18.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -180,6 +181,10 @@ return {
   raidSwitchMonitors = true,  -- bei Raid/Angriff alle Monitore auf die Verteidigungs-Karte schalten
   raidScanInterval = 10,      -- Sekunden zwischen Scans waehrend eines Raids
   raidRedstoneSide = "",      -- Redstone-Signal waehrend eines Raids, z.B. "back" ("" = aus)
+
+  -- ===== Pocket Computer =====
+  pocketEnabled = true,       -- Status per Funk an Pocket Computer senden (Wireless/Ender Modem noetig)
+  pocketCode = "",            -- Code fuer die Fernsteuerung; "" = beim Start automatisch erzeugen
 
   -- ===== Optionen-Reiter =====
   lockSettings = false,       -- true = Optionen nur am Computer-Terminal aenderbar, nicht am Monitor
@@ -3002,6 +3007,9 @@ function renderers.optionen(w, v)
   local locked = cfg.lockSettings and v and v.isMon
   rows[#rows+1] = textRow(locked and "Gesperrt (lockSettings) - aendern nur am Terminal" or "Antippen zum Umschalten. Wird sofort gespeichert.",
     locked and colors.orange or colors.lightGray)
+  if v and not v.isMon and cfg.pocketCode ~= "" then
+    rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket im Reiter Ctl eingeben)", w), colors.cyan)
+  end
   -- feste Zeile fuer Rueckmeldungen, damit sich die Zeilen beim Tippen nicht verschieben
   if settingsMsg and now() - settingsMsg.t < 10000 then rows[#rows+1] = textRow(fit(settingsMsg.text, w), settingsMsg.color)
   else rows[#rows+1] = blank() end
@@ -3303,6 +3311,104 @@ end
 -- ---------- Eingabe ----------
 local function setTab(v, id) if v.tab ~= id then v.tab = id; v.page = 1 end; drawView(v) end
 gotoTab = setTab
+-- Pocket Computer: kompakter Status per Funk, Befehle mit Pocket-Code
+local pocketStatus, pocketCommand
+do -- pocket
+local STATUS_PROTO, CMD_PROTO, ACK_PROTO = "ae2colony_status", "ae2colony_cmd", "ae2colony_ack"
+local CONTROL = {craftingEnabled=true, prestockEnabled=true, prestockCraft=true, autoUpdate=true,
+  chatEnabled=true, raidSwitchMonitors=true}
+
+local function cut(list, n) local out = {}; for i = 1, math.min(n, #list) do out[i] = list[i] end; return out end
+local function build()
+  local st = shownS or S
+  local col, me = st.colony or {}, st.me or {}
+  local d = {v=scriptVersion, t=os.epoch("utc"), name=col.name and asc(col.name) or "?"}
+  d.col = {happy=col.happy, cit=col.cit, lim=col.lim, graves=col.graves, raid=col.raid, attack=col.attack}
+  d.me = {online=st.online, status=st.meStatus, storage=me.storagePct and math.floor(me.storagePct),
+    energy=me.energyPct and math.floor(me.energyPct)}
+  local wh = st.warehouse
+  if wh and not wh.missing then d.wh = math.floor(wh.pct) end
+  local today = statsToday()
+  d.today = {sent=today.sent, crafts=today.crafts}
+  d.alerts = cut(st.alerts or {}, 6)
+  for _, e in ipairs(st.errors or {}) do if #d.alerts < 8 then d.alerts[#d.alerts+1] = e end end
+  d.problems = {}
+  for _, e in ipairs(st.requests or {}) do
+    if (e.state == "FEHLT" or e.state == "MANUELL" or e.state == "FEHLER" or e.old) and #d.problems < 15 then
+      d.problems[#d.problems+1] = {s=e.state, c=e.count, l=e.label, z=e.target, n=e.note}
+    end
+  end
+  d.builds = {}
+  for _, e in ipairs(st.builds or {}) do
+    if #d.builds < 8 then
+      d.builds[#d.builds+1] = {l=e.name, p=e.pct, a=e.approx, e=e.eta, c=e.claimed, m=e.missing, st=e.stage}
+    end
+  end
+  d.crafts = {}
+  for _, c in ipairs(crafts) do
+    if #d.crafts < 10 then d.crafts[#d.crafts+1] = {s=(c.stuck and c.state == "LAEUFT") and "HAENGT" or c.state, c=c.count, l=c.label, p=c.pct} end
+  end
+  -- Zu tun: zusammengefasst je Item
+  local need, order = {}, {}
+  local function add(label, count, why)
+    local e = need[label]
+    if not e then e = {l=label, c=0, w=why}; need[label] = e; order[#order+1] = e end
+    e.c = e.c + (count or 0)
+  end
+  for _, e in ipairs(st.requests or {}) do
+    if e.state == "FEHLT" or e.state == "MANUELL" then add(e.label, e.count, e.note) end
+  end
+  for _, b in ipairs(st.builds or {}) do
+    for _, r in ipairs(b.res or {}) do if r.state == "FEHLT" then add(r.label, r.count, r.note) end end
+  end
+  d.todo = cut(order, 15)
+  d.log = {}
+  for i = 1, math.min(15, #eventLog) do local e = eventLog[i]; d.log[i] = {t=e.t, k=e.k, x=e.x} end
+  d.update, d.waiting = updateInfo, updateWaiting
+  d.set = {}
+  for k in pairs(CONTROL) do d.set[k] = cfg[k] end
+  return d
+end
+
+function pocketStatus(target)
+  if not cfg.pocketEnabled or not rednet or not rednet.isOpen() then return end
+  local ok, d = pcall(build)
+  if not ok then logLine("Pocket: "..tostring(d)); return end
+  if target then rednet.send(target, d, STATUS_PROTO) else rednet.broadcast(d, STATUS_PROTO) end
+end
+
+local function ack(target, ok, msg) rednet.send(target, {ok=ok, msg=msg}, ACK_PROTO) end
+
+-- Befehle: {cmd="status"} (ohne Code), {cmd="refresh"|"update"|"toggle", key=Code, arg=Option}
+function pocketCommand(sender, msg)
+  if not cfg.pocketEnabled or type(msg) ~= "table" then return end
+  if msg.cmd == "status" then pocketStatus(sender); return end
+  if cfg.pocketCode == "" or tostring(msg.key) ~= cfg.pocketCode then ack(sender, false, "Falscher Pocket-Code"); return end
+  if msg.cmd == "refresh" then
+    os.queueEvent("ae2colony_refresh"); ack(sender, true, "Scan gestartet")
+  elseif msg.cmd == "update" then
+    if not updateInfo then ack(sender, false, "Kein Update verfuegbar"); return end
+    updateArm = now() + 8000   -- wie ein Doppeltipp: wartet auf laufende Crafts
+    ack(sender, true, "Update angestossen")
+    logEvent("Update per Pocket angestossen (Computer "..sender..")", "update")
+    updateTap()
+  elseif msg.cmd == "toggle" and CONTROL[msg.arg] then
+    for _, st in ipairs(SETTINGS) do
+      if st.key == msg.arg then
+        applySetting(st)
+        logEvent("Pocket: "..st.label.." = "..(cfg[st.key] and "AN" or "AUS"), "info")
+        ack(sender, true, st.label..": "..(cfg[st.key] and "AN" or "AUS"))
+        pocketStatus(sender)
+        return
+      end
+    end
+    ack(sender, false, "Option unbekannt")
+  else
+    ack(sender, false, "Unbekannter Befehl")
+  end
+end
+end -- pocket
+
 local inputLoop
 do -- eingabe
 local function nextPage(v, d) v.page = ((v.page-1+d) % v.pages) + 1; drawView(v) end
@@ -3352,7 +3458,8 @@ function inputLoop()
       local n = tonumber(a); if n == 0 then n = 10 end
       if n and TABS[n] then setTab(views.term, TABS[n].id) end
     elseif ev == "rednet_message" then
-      if c2 == "ae2colony_lager" then lagerMessage(b2) end
+      if c2 == "ae2colony_lager" then lagerMessage(b2)
+      elseif c2 == "ae2colony_cmd" then pocketCommand(a, b2) end
     elseif ev == "monitor_resize" or ev == "term_resize" then
       drawAll()
     elseif ev == "peripheral" or ev == "peripheral_detach" then
@@ -3374,6 +3481,11 @@ pcall(function()
     if peripheral.getType(name) == "modem" and peripheral.call(name, "isWireless") then rednet.open(name) end
   end
 end)
+if cfg.pocketCode == "" then
+  math.randomseed(os.epoch("utc"))
+  cfg.pocketCode = tostring(math.random(1000, 9999))
+  pcall(writeConfigValue, "pocketCode", cfg.pocketCode)
+end
 syncMonitors()
 findChatBox()
 logLine(string.format("%s v%s gestartet - AP %s", scriptName, scriptVersion, apVersionText))
@@ -3426,6 +3538,8 @@ local function scanLoop()
     if not okP then logLine("Update: "..tostring(errP)) end
     pcall(saveEvents)
     shownS = S
+    local okPk, errPk = pcall(pocketStatus)
+    if not okPk then logLine("Pocket: "..tostring(errPk)) end
     syncMonitors()
     drawAll()
     scanTick = raidMode and math.min(cfg.raidScanInterval, cfg.scanInterval) or cfg.scanInterval

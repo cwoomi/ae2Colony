@@ -1,5 +1,10 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.18.0-ATM10
+  - Pocket Computer: neues Programm ae2colony_pocket (Uebersicht, Probleme, Bau, Zu tun, Log, Steuerung)
+  - Hauptprogramm sendet nach jedem Scan einen kompakten Status per Funk (pocketEnabled)
+  - Fernsteuerung (Scan, Update, Auto-Crafting, Vorlieferung, ...) nur mit Pocket-Code; der Code wird beim
+    ersten Start erzeugt und nur am Computer-Terminal im Reiter Optionen angezeigt
 v0.17.0-ATM10
   - Fix Ueberliefern / volles Lager ("Teufelskreis"): Test mit Kurier, der nie abholt, 90 min:
     vorher 1152 Items in 18 Lieferungen, jetzt 128 (mit Lager-Zugriff) bzw. 256 (ohne)
