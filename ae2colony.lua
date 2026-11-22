@@ -55,9 +55,10 @@
 --          Vorlieferung pausiert ab 90 % Lager-Fuellstand, Mengen pro Lieferung/Scan begrenzt
 -- v0.18: * Pocket Computer: Status per Funk (ae2colony_pocket), Fernsteuerung mit Pocket-Code
 -- v0.18.1: * Pocket-Code auch auf der Startseite des Computer-Bildschirms, Taste O = Optionen
+-- v0.18.2: * Monitor: Knopf "Pocket-Code zeigen" im Reiter Optionen (15 s sichtbar)
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.18.1-ATM10"
+local scriptVersion = "0.18.2-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -3013,8 +3014,15 @@ function renderers.optionen(w, v)
   local locked = cfg.lockSettings and v and v.isMon
   rows[#rows+1] = textRow(locked and "Gesperrt (lockSettings) - aendern nur am Terminal" or "Antippen zum Umschalten. Wird sofort gespeichert.",
     locked and colors.orange or colors.lightGray)
-  if v and not v.isMon and cfg.pocketCode ~= "" then
-    rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket: Reiter Ctl)", w), colors.cyan)
+  if v and cfg.pocketEnabled and cfg.pocketCode ~= "" then
+    if not v.isMon or (v.revealUntil and now() < v.revealUntil) then
+      rows[#rows+1] = textRow(fit("Pocket-Code: "..cfg.pocketCode.."  (am Pocket: Reiter Ctl)", w), colors.cyan)
+    elseif not locked then
+      -- auf Monitoren nur auf Wunsch kurz zeigen (Monitore sieht jeder)
+      local r = textRow("[ Pocket-Code zeigen ]", colors.cyan)
+      r.action = function(view) view.revealUntil = now() + 15000 end
+      rows[#rows+1] = r
+    end
   end
   -- feste Zeile fuer Rueckmeldungen, damit sich die Zeilen beim Tippen nicht verschieben
   if settingsMsg and now() - settingsMsg.t < 10000 then rows[#rows+1] = textRow(fit(settingsMsg.text, w), settingsMsg.color)

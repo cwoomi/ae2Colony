@@ -7,8 +7,9 @@
 --
 -- Bedienung: Reiter oben antippen (oder Pfeil links/rechts), scrollen mit Mausrad / Pfeil hoch/runter.
 -- Steuern (Reiter "Ctl") braucht den Pocket-Code, der am Hauptcomputer im Reiter Optionen steht.
+-- Mehrere Kolonien: Kopfzeile antippen wechselt die Kolonie, im Reiter Ctl ein-/ausblenden.
 
-local VERSION = "1.1"
+local VERSION = "1.2"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/ae2colony_pocket.lua"
 local UPDATE_EVERY = 3600   -- Sekunden zwischen zwei Update-Pruefungen
 local STATUS_PROTO, CMD_PROTO, ACK_PROTO = "ae2colony_status", "ae2colony_cmd", "ae2colony_ack"
@@ -68,7 +69,14 @@ local function saveSettings()
 end
 
 -- ---------- Zustand ----------
-local data, dataT, server = nil, nil, settings.server
+settings.hide = settings.hide or {}     -- Computer-ID -> true = Kolonie ausgeblendet
+settings.codes = settings.codes or {}   -- Computer-ID -> Pocket-Code dieser Kolonie
+if settings.code and settings.server and not settings.codes[settings.server] then
+  settings.codes[settings.server] = settings.code   -- Code aus Pocket v1.1 uebernehmen
+end
+local servers = {}                      -- Computer-ID -> {data, t}
+local current = settings.current        -- angezeigte Kolonie (Computer-ID)
+local data, dataT, server = nil, nil, nil
 local tabs = {{id="home", l="Hom"}, {id="prob", l="Prb"}, {id="bau", l="Bau"},
   {id="todo", l="Tdo"}, {id="log", l="Log"}, {id="ctl", l="Ctl"}}
 local tab, scroll = 1, 0
@@ -90,9 +98,25 @@ local function fit(s, n)
   if #s > n then return n > 1 and (s:sub(1, n - 1)..".") or s:sub(1, n) end
   return s..string.rep(" ", n - #s)
 end
+local function nameOf(id) return servers[id] and servers[id].data and servers[id].data.name or ("Computer "..id) end
+local function visibleIds()
+  local ids = {}
+  for id in pairs(servers) do if not settings.hide[id] then ids[#ids+1] = id end end
+  table.sort(ids, function(a, b) return nameOf(a) < nameOf(b) end)
+  return ids
+end
+-- angezeigte Kolonie bestimmen (falls ausgeblendet/unbekannt: erste sichtbare)
+local function selectCurrent()
+  if not (current and servers[current] and not settings.hide[current]) then
+    current = visibleIds()[1]
+  end
+  server = current
+  local e = current and servers[current]
+  data, dataT = e and e.data, e and e.t
+end
 local function send(cmd, arg)
-  if not server then msg, msgT = "Noch kein Hauptcomputer gefunden", (os.epoch("utc") / 1000); return end
-  rednet.send(server, {cmd=cmd, key=settings.code, arg=arg}, CMD_PROTO)
+  if not server then msg, msgT = "Keine Kolonie ausgewaehlt", (os.epoch("utc") / 1000); return end
+  rednet.send(server, {cmd=cmd, key=settings.codes[server], arg=arg}, CMD_PROTO)
 end
 
 -- ---------- Inhalt je Reiter: Liste von {text, farbe, [aktion]} ----------
@@ -118,15 +142,17 @@ local function lines()
       first = false
     until t == "" or fn
   end
-  if not data then
-    add("Warte auf Daten vom", colors.lightGray)
-    add("Hauptcomputer ...", colors.lightGray)
-    add("")
-    add("Hauptcomputer braucht ein", colors.gray)
-    add("Wireless/Ender Modem.", colors.gray)
+  local id = tabs[tab].id
+  if not data and id ~= "ctl" then
+    if next(servers) then
+      add("Alle Kolonien ausgeblendet. Im Reiter Ctl wieder einblenden.", colors.orange)
+    else
+      add("Warte auf Daten vom Hauptcomputer ...", colors.lightGray)
+      add("")
+      add("Der Hauptcomputer braucht ein Wireless- oder Ender-Modem.", colors.gray)
+    end
     return L
   end
-  local id = tabs[tab].id
   if id == "home" then
     local c = data.col or {}
     if c.raid then add(" RAID! ", colors.red) elseif c.attack then add(" Angriff! ", colors.orange) end
@@ -189,24 +215,40 @@ local function lines()
       add(os.date("%H:%M", e.t / 1000).." "..tostring(e.x), c)
     end
   elseif id == "ctl" then
-    if not settings.code then
-      add("Zum Steuern den Pocket-Code eingeben. Er steht am Hauptcomputer im Reiter Optionen.", colors.lightGray)
+    -- Kolonien ein-/ausblenden
+    add("- Kolonien -", colors.lightGray)
+    local all = {}
+    for sid in pairs(servers) do all[#all+1] = sid end
+    table.sort(all, function(a, b) return nameOf(a) < nameOf(b) end)
+    if #all == 0 then add("noch keine gefunden", colors.gray) end
+    for _, sid in ipairs(all) do
+      local shown = not settings.hide[sid]
+      local age = os.epoch("utc") - servers[sid].t
+      add(fit("["..(shown and "x" or " ").."] "..nameOf(sid), W - 5)..fit(" "..fmtAge(age), 5),
+        shown and (sid == current and colors.yellow or colors.white) or colors.gray, function()
+          if shown and #visibleIds() <= 1 then msg, msgT = "Mind. 1 Kolonie sichtbar", (os.epoch("utc") / 1000); return end
+          settings.hide[sid] = shown or nil
+          saveSettings()
+        end)
+    end
+    if not data then return L end
+    add("")
+    add("- "..tostring(data.name).." -", colors.yellow)
+    if not settings.codes[server] then
+      add("Zum Steuern den Pocket-Code dieser Kolonie eingeben (Hauptcomputer, Reiter Optionen).", colors.lightGray)
     end
     add("[ Code eingeben ]", colors.cyan, function()
       term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
       term.setTextColor(colors.white)
-      print("Pocket-Code eingeben:")
+      print("Pocket-Code fuer")
+      print(tostring(data.name)..":")
       local c = read()
-      if c and c ~= "" then settings.code = c; saveSettings(); msg, msgT = "Code gespeichert", (os.epoch("utc") / 1000) end
+      if c and c ~= "" then settings.codes[server] = c; saveSettings(); msg, msgT = "Code gespeichert", (os.epoch("utc") / 1000) end
     end)
-    add("")
     add("[ Jetzt scannen ]", colors.lime, function() send("refresh") end)
-    add("[ Pocket-Update suchen ]", colors.cyan, function() msg, msgT = selfUpdate(), (os.epoch("utc") / 1000) end)
     if data.update then
       add("[ Update "..tostring(data.update).." ]", colors.yellow, function() send("update") end)
     end
-    add("")
-    add("Pocket v"..VERSION.."  Hauptprogramm v"..tostring(data.v or "?"), colors.gray)
     local labels = {craftingEnabled="Auto-Crafting", prestockEnabled="Vorlieferung", prestockCraft="Bau craften",
       autoUpdate="Auto-Update", chatEnabled="Chat", raidSwitchMonitors="Raid-Monitore"}
     local keys = {"craftingEnabled", "prestockEnabled", "prestockCraft", "chatEnabled", "raidSwitchMonitors", "autoUpdate"}
@@ -216,19 +258,35 @@ local function lines()
         add(fit("["..(v and "AN " or "AUS").."] "..labels[k], W), v and colors.lime or colors.red, function() send("toggle", k) end)
       end
     end
+    add("")
+    add("[ Pocket-Update suchen ]", colors.cyan, function() msg, msgT = selfUpdate(), (os.epoch("utc") / 1000) end)
+    add("Pocket v"..VERSION.."  Haupt v"..tostring(data.v or "?"), colors.gray)
   end
   return L
 end
 
 -- ---------- Zeichnen ----------
 local function draw()
+  selectCurrent()
   term.setBackgroundColor(colors.black); term.clear()
   buttons = {}
-  -- Kopf
+  -- Kopf: Kolonie-Name, bei mehreren "(2/3)" - antippen wechselt
   term.setCursorPos(1, 1)
   local raid = data and data.col and (data.col.raid or data.col.attack)
-  term.setBackgroundColor(col(raid and colors.red or colors.gray)); term.setTextColor(colors.white)
-  term.write(fit(" "..(data and data.name or "AE2 Colony"), W))
+  -- Raid in einer anderen sichtbaren Kolonie? Dann Hinweis im Kopf
+  local otherRaid = false
+  for _, sid in ipairs(visibleIds()) do
+    local d = servers[sid].data
+    if sid ~= current and d and d.col and d.col.raid then otherRaid = true end
+  end
+  local ids = visibleIds()
+  local pos = ""
+  if #ids > 1 then
+    for i, sid in ipairs(ids) do if sid == current then pos = " "..i.."/"..#ids end end
+  end
+  term.setBackgroundColor(col((raid or otherRaid) and colors.red or colors.gray)); term.setTextColor(colors.white)
+  local right = (otherRaid and " RAID!" or "")..pos.." "
+  term.write(fit(" "..(data and data.name or "AE2 Colony"), W - #right)..right)
   -- Reiter
   term.setCursorPos(1, 2)
   local x = 1
@@ -283,8 +341,8 @@ while true do
   local ev, a, b, c = os.pullEvent()
   if ev == "rednet_message" then
     if c == STATUS_PROTO and type(b) == "table" then
-      data, dataT = b, os.epoch("utc")
-      if server ~= a then server = a; settings.server = a; saveSettings() end
+      servers[a] = {data=b, t=os.epoch("utc")}
+      if not current then current = a end
       draw()
     elseif c == ACK_PROTO and type(b) == "table" then
       msg, msgT = tostring(b.msg), (os.epoch("utc") / 1000)
@@ -298,7 +356,14 @@ while true do
     draw()
   elseif ev == "mouse_click" or ev == "monitor_touch" then
     local mx, my = b, c
-    if my == 2 then
+    if my == 1 then
+      -- naechste sichtbare Kolonie
+      local ids = visibleIds()
+      for i, sid in ipairs(ids) do
+        if sid == current then current = ids[i % #ids + 1]; break end
+      end
+      settings.current = current; saveSettings(); scroll = 0
+    elseif my == 2 then
       for i, t in ipairs(tabs) do if mx >= t.x1 and mx <= t.x2 then tab, scroll = i, 0 end end
     else
       for _, bt in ipairs(buttons) do if bt.y == my then bt.fn(); break end end
@@ -312,7 +377,12 @@ while true do
     elseif a == keys.right then tab = tab % #tabs + 1; scroll = 0
     elseif a == keys.up then scroll = scroll - 1
     elseif a == keys.down then scroll = scroll + 1
-    elseif a == keys.r then send("refresh") end
+    elseif a == keys.r then send("refresh")
+    elseif a == keys.tab then
+      local ids = visibleIds()
+      for i, sid in ipairs(ids) do if sid == current then current = ids[i % #ids + 1]; break end end
+      settings.current = current; saveSettings(); scroll = 0
+    end
     draw()
   end
 end

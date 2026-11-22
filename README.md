@@ -36,7 +36,8 @@ Status der Kolonie unterwegs ansehen und das Programm fernsteuern.
   ```
 - **Updates:** Der Pocket sucht beim Start und danach stündlich selbst nach einer neuen Version und aktualisiert sich automatisch (oder im Reiter Ctl: „Pocket-Update suchen“).
 - **Reiter:** Hom (Übersicht), Prb (Probleme + Crafts), Bau, Tdo (Zu tun), Log, Ctl (Steuerung). Wechseln per Antippen oder Pfeil links/rechts, scrollen mit Mausrad oder Pfeil hoch/runter.
-- **Steuern** (Reiter Ctl: Scan starten, Update auslösen, Auto-Crafting, Vorlieferung usw.) braucht den **Pocket-Code**. Er steht am Hauptcomputer im Reiter **Optionen**, nur auf dem Computer-Bildschirm, nicht auf den Monitoren. Ansehen können alle Pockets in Reichweite, steuern nur, wer den Code kennt.
+- **Mehrere Kolonien:** Jeder Hauptcomputer funkt seine Kolonie. Kopfzeile antippen wechselt die Kolonie; im Reiter Ctl unter „Kolonien“ ein- und ausblenden, welche du sehen willst.
+- **Steuern** (Reiter Ctl: Scan starten, Update auslösen, Auto-Crafting, Vorlieferung usw.) braucht den **Pocket-Code**. Er steht auf der Startseite und im Reiter **Optionen** des Computer-Bildschirms; auf Monitoren nur über den Knopf „Pocket-Code zeigen“ (15 Sekunden). Jede Kolonie hat ihren eigenen Code. Ansehen können alle Pockets in Reichweite, steuern nur, wer den Code kennt.
 
 ## Lager-Füllstand (MineColonies Warehouse)
 

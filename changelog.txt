@@ -1,5 +1,9 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.18.2-ATM10 / Pocket v1.2
+  - Monitor: Knopf "Pocket-Code zeigen" im Reiter Optionen (Code 15 s sichtbar; gesperrt mit lockSettings)
+  - Pocket: mehrere Kolonien - Kopfzeile antippen (oder Tab-Taste) wechselt, im Reiter Ctl Kolonien
+    ein-/ausblenden; Pocket-Code wird pro Kolonie gespeichert; "RAID!" im Kopf bei Raid in anderer Kolonie
 Pocket v1.1
   - Pocket aktualisiert sich selbst: Pruefung beim Start und stuendlich, Knopf "Pocket-Update suchen" im Reiter Ctl
   - Reiter Ctl zeigt die Versionen von Pocket und Hauptprogramm
