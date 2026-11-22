@@ -50,9 +50,12 @@
 --            Sperre mehr (automatisch erkannt, Schalter cpuCheck)
 --          * Craftbarkeit ueber AE2s Liste craftbarer Items (getCraftableItems) statt isCraftable:
 --            erkennt auch Rezepte, die nicht in Pattern Providern liegen (z.B. Advanced AE Quantum Crafter)
+-- v0.17: * Kein Ueberliefern mehr: Vorlieferung merkt sich, was unterwegs/im Lager ist; Anfragen werden
+--          nicht beliefert, wenn das Item im Lager liegt, und hoechstens 1x nach 30 min nachgeliefert;
+--          Vorlieferung pausiert ab 90 % Lager-Fuellstand, Mengen pro Lieferung/Scan begrenzt
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.16.4-ATM10"
+local scriptVersion = "0.17.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -76,7 +79,9 @@ return {
   warehouseInterval = 60,     -- Sekunden: Lager-Fuellstand neu abfragen
   foodInterval = 300,         -- Sekunden: Essens-Vorrat im ME neu zaehlen
   maxStockLookups = 40,       -- hoechstens so viele ME-Abfragen pro Scan (Rest kommt im naechsten Scan dran)
-  resendCooldown = 300,       -- Sekunden Wartezeit nach einer Lieferung, bevor erneut geliefert wird
+  resendCooldown = 300,       -- Sekunden: gleiches Item nicht erneut an dasselbe Ziel (Doppel-Schutz)
+  resendAfterMinutes = 30,    -- Anfrage nach vollstaendiger Lieferung noch offen: fruehestens dann nachliefern
+  maxResends = 1,             -- so oft wird pro Anfrage hoechstens nachgeliefert
   craftingEnabled = true,     -- false = keine Crafts ueber die ME Bridge starten (nur ausliefern)
   craftMaxStack = false,      -- true = immer mindestens 64 Stueck craften
   maxCraftCandidates = 5,     -- wie viele Alternativ-Items maximal auf Craftbarkeit geprueft werden
@@ -102,7 +107,10 @@ return {
   prestockSide = "",          -- "" = wie exportSide, sonst eigenes Ziel
   prestockCraft = true,       -- fehlendes Baumaterial automatisch craften
   prestockMaxCraft = 128,     -- maximale Menge pro Craft-Auftrag fuer Baumaterial (kleiner = kuerzere Crafts)
-  prestockCooldown = 600,     -- Sekunden, bevor fuer dieselbe Baustelle/Item nachgeliefert wird
+  prestockCooldown = 600,     -- Sekunden: Schutz gegen doppelte Vorlieferung innerhalb kurzer Zeit
+  prestockMaxPerItem = 256,   -- hoechstens so viele Stueck pro Item und Lieferung
+  prestockMaxPerScan = 1024,  -- hoechstens so viele Stueck Baumaterial pro Scan insgesamt
+  warehouseStopPercent = 90,  -- Vorlieferung pausieren, wenn das Lager so voll ist (0 = nie)
   -- Vorab-Crafting: fehlendes Baumaterial aller angenommenen Bauauftraege wird gecraftet,
   -- aber nur, solange genug Crafting-CPUs frei sind (Buerger-Anfragen haben Vorrang).
   craftReserveCpus = 1,       -- so viele CPUs bleiben fuer Buerger-Anfragen frei
@@ -344,6 +352,9 @@ local sentAt     = {}   -- request id -> Zeitpunkt der letzten Lieferung
 local firstSeen  = {}   -- request id -> Zeitpunkt, an dem die Anfrage zuerst gesehen wurde
 local delivered  = {}   -- "zielPos|item|hash" -> {t=Zeitpunkt, n=Menge}
 local exportBuffer = {}
+local pendingBuild = {}   -- "builder|item|hash" -> {g0 = Bedarf bei Lieferung, n = unterwegs, t = Zeit}
+local sentAmount = {}     -- request id -> bisher geliefert
+local resendCount = {}    -- request id -> wie oft nachgeliefert
 local stockCache = {}   -- item -> {t, list}: zuletzt gelesener ME-Bestand (jede Abfrage geht das ganze ME durch)
 local updateWaiting = false   -- Update steht an: keine neuen Crafts, installieren sobald keine mehr laufen
 
@@ -744,7 +755,7 @@ end
 end -- essen
 
 -- Lager (MineColonies Warehouse): kombiniertes Inventar aller Racks
-local readWarehouse, lagerMessage
+local readWarehouse, lagerMessage, warehouseCount
 do -- lager
 local remote, remoteT = nil, nil
 local function isWarehouse(name)
@@ -762,6 +773,12 @@ local function findWarehouse()
       if p and p.list and p.size then return p end
     end
   end
+end
+-- Menge eines Items im Lager; nil, wenn das Lager nicht lesbar ist (bzw. alter Funk-Sender)
+function warehouseCount(name)
+  local w = S.warehouse
+  if not w or w.missing or type(w.items) ~= "table" then return nil end
+  return tonumber(w.items[name]) or 0
 end
 function lagerMessage(msg)
   if type(msg) == "table" and tonumber(msg.size) then remote, remoteT = msg, now() end
@@ -788,7 +805,7 @@ function readWarehouse()
       for nm, n in pairs(by) do top[#top+1] = {name=nm, n=n}; kinds = kinds + 1 end
       table.sort(top, function(a, b) return a.n > b.n end)
       while #top > 8 do table.remove(top) end
-      direct = {size=tonumber(size), used=used, total=total, top=top, kinds=kinds, src="direkt"}
+      direct = {size=tonumber(size), used=used, total=total, top=top, kinds=kinds, src="direkt", items=by}
     end
   end
   w = direct
@@ -1053,7 +1070,13 @@ function processExportBuffer(b)
         if moved < it.count then sc.t = 0 end
       end
       summary[#summary+1] = moved.."x "..(it.label or shortName(it.name))
-      if it.reqId then sentAt[it.reqId] = now() end
+      if it.reqId then
+        sentAt[it.reqId] = now()
+        sentAmount[it.reqId] = (sentAmount[it.reqId] or 0) + moved
+      end
+      if it.buildKey then
+        pendingBuild[it.buildKey] = {g0=it.buildGap, n=(it.buildOut or 0) + moved, t=now()}
+      end
       if it.key then
         local d = recentDelivery(it.key, it.cooldown or cfg.resendCooldown)
         if d then d.n = d.n + moved; d.t = now() else delivered[it.key] = {t=now(), n=moved} end
@@ -1321,15 +1344,38 @@ function handleRequests(b, requests, byName)
       S.requests[#S.requests+1] = entry
       local last = req.id and sentAt[req.id]
       local pre = recentDelivery(deliveryKey(tpos, it.name, itemHash(it)), cfg.prestockCooldown)
-      if last and (t-last) < cfg.resendCooldown*1000 then
-        entry.state = "WARTET"
-        entry.note = string.format("abholen, neu in %ds", math.ceil((cfg.resendCooldown*1000-(t-last))/1000))
+      local inWh = warehouseCount(it.name)
+      local already = req.id and sentAmount[req.id] or 0
+      local resendWait = cfg.resendAfterMinutes * 60000
+      local deliver = count
+      if inWh and inWh >= count then
+        -- liegt schon im Lager: der Kurier bringt es, mehr liefern fuellt nur die Racks
+        entry.state = "WARTET"; entry.note = "liegt im Lager (x"..inWh..") - Kurier holt ab"
+        deliver = 0
+      elseif last and already >= count then
+        if (t - last) < resendWait or (resendCount[req.id] or 0) >= cfg.maxResends then
+          entry.state = "WARTET"
+          entry.note = (t - last) < resendWait and ("geliefert vor "..fmtAge(t - last)..", wartet auf Kurier")
+            or "geliefert, nicht abgeholt - Lager/Kurier pruefen"
+          deliver = 0
+        else
+          -- lange nicht abgeholt und nicht im Lager (verloren?): einmal nachliefern
+          resendCount[req.id] = (resendCount[req.id] or 0) + 1
+          sentAmount[req.id] = 0
+          logEvent("Nachlieferung: "..count.."x "..entry.label.." ("..entry.target..")", "info")
+        end
+      elseif last and (t - last) < cfg.resendCooldown * 1000 and already > 0 then
+        deliver = count - already   -- Teillieferung ergaenzen
       elseif pre and not last and pre.n >= count then
         entry.state = "WARTET"; entry.note = "x"..pre.n.." vorgeliefert"
-      elseif it.name:find("domum_ornamentum", 1, true) then
-        handleDomum(req, it, count, tpos, byName, entry)
-      else
-        handleGeneric(req, count, tpos, byName, b, entry)
+        deliver = 0
+      end
+      if deliver > 0 then
+        if it.name:find("domum_ornamentum", 1, true) then
+          handleDomum(req, it, deliver, tpos, byName, entry)
+        else
+          handleGeneric(req, deliver, tpos, byName, b, entry)
+        end
       end
       if cfg.oldRequestMinutes > 0 and entry.age >= cfg.oldRequestMinutes*60000 and entry.state ~= "SKIP" then
         entry.old = true; oldCount = oldCount + 1
@@ -1340,7 +1386,7 @@ function handleRequests(b, requests, byName)
     end
   end
   if oldCount > 0 then addAlert(oldCount.." Anfrage(n) offen seit > "..cfg.oldRequestMinutes.." min") end
-  for id in pairs(sentAt) do if not activeIds[id] then sentAt[id] = nil end end
+  for id in pairs(sentAt) do if not activeIds[id] then sentAt[id] = nil; sentAmount[id] = nil; resendCount[id] = nil end end
   -- erledigte Anfragen: Wartezeit fuer die Statistik
   local st = statsToday()
   st.reqTimes = st.reqTimes or {}
@@ -1482,6 +1528,10 @@ end
 
 function handleBuilds(b, orders, resources, byName)
   if type(orders) ~= "table" then return end
+  local budget = cfg.prestockMaxPerScan
+  local wh = S.warehouse
+  local whFull = wh and not wh.missing and cfg.warehouseStopPercent > 0 and wh.pct >= cfg.warehouseStopPercent
+  if whFull and cfg.prestockEnabled then addAlert("Lager zu "..math.floor(wh.pct).."% voll - Vorlieferung pausiert") end
   local active = {}
   local started = 0
   local tNow = now()
@@ -1519,12 +1569,27 @@ function handleBuilds(b, orders, resources, byName)
         for _, r in ipairs(res) do
           local it = r.item
           if it and it.name then
-            local need = (tonumber(r.needs) or 0) - (tonumber(r.available) or 0) - (tonumber(r.delivering) or 0)
+            -- gap = was dem Builder fehlt (weder bei ihm noch zu ihm unterwegs)
+            local gap = (tonumber(r.needs) or 0) - (tonumber(r.available) or 0) - (tonumber(r.delivering) or 0)
             local hash = itemHash(it)
             local key = deliveryKey(builderPos, it.name, hash)
-            local d = recentDelivery(key, cfg.prestockCooldown)
-            if d then need = need - d.n end
+            -- schon geliefert, aber noch nicht beim Builder (liegt im Lager / beim Kurier)?
+            local outstanding = 0
+            local pb = pendingBuild[key]
+            if pb then
+              local arrived = math.max(0, pb.g0 - gap)
+              outstanding = math.max(0, pb.n - arrived)
+              if outstanding == 0 or now() - pb.t > 3600000 then pendingBuild[key] = nil; outstanding = 0 end
+            end
+            local inWh = warehouseCount(it.name) or 0
+            local need = gap - math.max(outstanding, inWh)
             for _, q in ipairs(exportBuffer) do if q.key == key then need = need - q.count end end
+            if gap > 0 and need <= 0 then
+              -- Bedarf ist gedeckt, die Ware ist nur noch nicht beim Builder
+              local row = {label=asc(r.displayName or itemLabel(it)), count=gap, state="WARTET",
+                note=outstanding > 0 and ("x"..outstanding.." geliefert, Kurier bringt es") or ("im Lager: "..inWh)}
+              entry.res[#entry.res+1] = row
+            end
             if need > 0 then
               entry.open = entry.open + 1
               local row = {label=asc(r.displayName or itemLabel(it)), count=need, state="OFFEN", note=""}
@@ -1532,17 +1597,24 @@ function handleBuilds(b, orders, resources, byName)
               local found = findBridgeItem(byName, it.name, hash)
               local stock = found and (tonumber(found.count) or 0) or 0
               local send = 0
-              if cfg.prestockEnabled then
-                send = math.min(need, stock)
+              if cfg.prestockEnabled and whFull then
+                row.note = "Lager voll - pausiert"
+              elseif cfg.prestockEnabled then
+                send = math.max(0, math.min(need, stock, cfg.prestockMaxPerItem, budget))
                 if send > 0 then
+                  budget = budget - send
                   takeStock(found, send)
                   queueExport({name=it.name, hash=hash, count=send, side=cfg.prestockSide,
-                    label=row.label, key=key, cooldown=cfg.prestockCooldown, entry=row})
+                    label=row.label, key=key, cooldown=cfg.prestockCooldown, entry=row,
+                    buildKey=key, buildGap=gap, buildOut=outstanding})
                   row.state = "OK"; row.note = "x"..send.." geliefert"
+                elseif stock > 0 then
+                  row.note = "naechster Scan (Mengenlimit)"
                 end
               end
               -- ohne Vorlieferung zaehlt der ME-Bestand als "bereit"
-              local rest = need - send - (cfg.prestockEnabled and 0 or stock)
+              -- craften nur, was im ME wirklich fehlt (nicht, was nur wegen Mengenlimit/Lager-Pause wartet)
+              local rest = need - stock
               local pre = send > 0 and ("x"..send.." geliefert, ") or ""
               if rest <= 0 then
                 if not cfg.prestockEnabled then row.state = "OK"; row.note = "im ME: "..stock end

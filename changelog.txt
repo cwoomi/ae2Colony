@@ -1,5 +1,15 @@
 I don't really know how changelogs or versioning is suppose to work, but my attempt.
 
+v0.17.0-ATM10
+  - Fix Ueberliefern / volles Lager ("Teufelskreis"): Test mit Kurier, der nie abholt, 90 min:
+    vorher 1152 Items in 18 Lieferungen, jetzt 128 (mit Lager-Zugriff) bzw. 256 (ohne)
+  - Baumaterial: das Skript merkt sich, was geliefert, aber noch nicht beim Builder angekommen ist, und
+    zaehlt den Lagerbestand mit; Anzeige "xN geliefert, Kurier bringt es" / "im Lager: N"
+  - Anfragen: keine Lieferung, wenn das Item im Lager liegt; Teillieferungen werden ergaenzt; nach
+    vollstaendiger Lieferung hoechstens 1x nachliefern, fruehestens nach 30 min (resendAfterMinutes, maxResends)
+  - Vorlieferung pausiert ab 90 % Lager-Fuellstand (warehouseStopPercent); max. 256 Stueck pro Item und
+    Lieferung (prestockMaxPerItem), max. 1024 Stueck pro Scan (prestockMaxPerScan)
+  - Lager-Sender (ae2colony_lager) schickt jetzt auch die Item-Zaehlung mit - bitte dort neu laden
 v0.16.4-ATM10
   - Craftbarkeit ueber AE2s Liste craftbarer Items (getCraftableItems) statt AP isCraftable, das nur Patterns
     in Pattern Providern kennt -> Rezepte aus dem Advanced AE Quantum Crafter werden jetzt gecraftet

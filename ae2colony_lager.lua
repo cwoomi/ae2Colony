@@ -57,7 +57,7 @@ while true do
       for nm, n in pairs(by) do top[#top+1] = {name=nm, n=n}; kinds = kinds + 1 end
       table.sort(top, function(a, b) return a.n > b.n end)
       while #top > 8 do table.remove(top) end
-      rednet.broadcast({size=size, used=used, total=total, kinds=kinds, top=top}, PROTOCOL)
+      rednet.broadcast({size=size, used=used, total=total, kinds=kinds, top=top, items=by}, PROTOCOL)
       print(string.format("%s  %d/%d Slots (%d%%) gesendet", os.date("%H:%M:%S"), used, size,
         size > 0 and math.floor(used / size * 100) or 0))
     else
