@@ -51,6 +51,15 @@ Das Programm zeigt, wie voll das Lager ist (Kachel „ME-Netz“, Reiter „Kolo
   ```
   Der Sender funkt den Füllstand alle 20 Sekunden an das Hauptprogramm.
 
+## Kolonie-Relais (Hauptcomputer außerhalb der Kolonie)
+
+Der Colony Integrator muss in der Kolonie stehen, der Hauptcomputer nicht:
+
+- **Per Kabel:** Wired Modem an den Integrator, Netzwerkkabel bis zum Hauptcomputer (alle Chunks auf der Strecke müssen geladen sein).
+- **Per Funk:** Den Integrator an den Lager-Computer setzen (direkt oder per Wired Modem), auf dem `ae2colony_lager` läuft. Lager-Computer und Hauptcomputer brauchen ein Wireless- oder Ender-Modem. Findet der Hauptcomputer keinen eigenen Integrator, sucht er das Relais automatisch und holt alle Kolonie-Daten per Funk. Bei mehreren Kolonien in der Config `colonyRelayId` auf die Computer-ID des passenden Lager-Computers setzen.
+
+Die ME Bridge bleibt am Hauptcomputer; geliefert wird wie bisher in die Kiste an `exportSide` der Bridge.
+
 ## Dateien
 
 | Datei | Zweck |
@@ -58,7 +67,7 @@ Das Programm zeigt, wie voll das Lager ist (Kachel „ME-Netz“, Reiter „Kolo
 | `ae2colony.lua` | Hauptprogramm |
 | `update.lua` | Installer/Updater |
 | `ae2colony_debug.lua` | Diagnose (`ae2colony_debug upload`) |
-| `ae2colony_lager.lua` | Funk-Sender für den Lager-Füllstand (auf einem zweiten Computer) |
+| `ae2colony_lager.lua` | Funk-Sender für den Lager-Füllstand und Kolonie-Relais (auf einem zweiten Computer) |
 | `ae2colony_pocket.lua` | Programm für den Pocket Computer |
 
 ## Neue Version veröffentlichen

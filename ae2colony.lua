@@ -56,9 +56,11 @@
 -- v0.18: * Pocket Computer: Status per Funk (ae2colony_pocket), Fernsteuerung mit Pocket-Code
 -- v0.18.1: * Pocket-Code auch auf der Startseite des Computer-Bildschirms, Taste O = Optionen
 -- v0.18.2: * Monitor: Knopf "Pocket-Code zeigen" im Reiter Optionen (15 s sichtbar)
+-- v0.19: * Kolonie-Relais: Colony Integrator am Lager-Computer, Kontroll-PC holt die Daten per Funk
+--          (Hauptcomputer kann ausserhalb der Kolonie stehen)
 
 local scriptName = "AE2 Colony"
-local scriptVersion = "0.18.2-ATM10"
+local scriptVersion = "0.19.0-ATM10"
 local UPDATE_URL = "https://raw.githubusercontent.com/cwoomi/ae2Colony/main/"
 local CONFIG_FILE = "ae2colony_config.lua"
 local PROGRAM_PATH = shell and shell.getRunningProgram and shell.getRunningProgram() or "ae2colony.lua"
@@ -139,6 +141,10 @@ return {
   -- Lager-Huettenblock als Peripheral (Wired Modem / direkt angrenzend). "" = automatisch suchen.
   -- Ohne Kabel: Programm "ae2colony_lager" auf einem Computer am Lager, beide mit Wireless/Ender Modem.
   warehousePeripheral = "",
+  -- Kolonie-Relais: Ist kein Colony Integrator angeschlossen, holt das Programm die Kolonie-Daten
+  -- per Funk vom Lager-Computer (ae2colony_lager mit Colony Integrator). 0 = automatisch suchen,
+  -- sonst die Computer-ID des Lager-Computers (bei mehreren Kolonien).
+  colonyRelayId = 0,
   energyWarnPercent = 10,     -- ME-Energie: Warnung unter diesem Stand (0 = aus)
   oldRequestMinutes = 10,     -- Anfragen, die laenger offen sind, gelten als "haengend" (0 = aus)
   citizenHappinessBelow = 5,  -- Buerger unter dieser Zufriedenheit gelten als unzufrieden
@@ -495,9 +501,63 @@ end
 -- =====================================================================
 -- Peripherals
 -- =====================================================================
+-- Kolonie-Relais: Stellvertreter-Objekt, das jeden Aufruf per Funk an den Lager-Computer schickt
+local function relayColony(id)
+  local seq, downUntil, warnedS = 0, 0, nil
+  local function down()
+    if warnedS ~= S then
+      warnedS = S
+      addError("Kolonie-Relais (Computer "..id..") nicht erreichbar - Lager-Computer an? Chunk geladen?")
+    end
+    error("Kolonie-Relais nicht erreichbar", 0)
+  end
+  local function remote(m, ...)
+    if os.epoch("utc") < downUntil then down() end
+    for _ = 1, 2 do
+      seq = seq + 1
+      local my = seq
+      rednet.send(id, {id=my, m=m, a=table.pack(...)}, "ae2colony_colony")
+      local deadline = os.epoch("utc") + 4000
+      while true do
+        local left = (deadline - os.epoch("utc")) / 1000
+        if left <= 0 then break end
+        local from, r = rednet.receive("ae2colony_colony_r", left)
+        if from == id and type(r) == "table" and r.id == my then
+          if not r.ok then error(tostring(r.err), 0) end
+          return table.unpack(r.r or {}, 1, r.r and r.r.n or 0)
+        end
+      end
+    end
+    downUntil = os.epoch("utc") + 20000
+    down()
+  end
+  return setmetatable({}, {__index=function(t, k)
+    local f = function(...) return remote(k, ...) end
+    t[k] = f
+    return f
+  end})
+end
 local function setupPeripherals()
   local b = peripheral.find("me_bridge") or error("me_bridge nicht gefunden")
-  local c = peripheral.find("colony_integrator") or error("colony_integrator nicht gefunden")
+  local c = peripheral.find("colony_integrator")
+  if not c then
+    if not rednet.isOpen() then error("colony_integrator nicht gefunden (oder Funk-Modem fuer das Kolonie-Relais)") end
+    local id = tonumber(cfg.colonyRelayId) or 0
+    while id == 0 do
+      print("Kein Colony Integrator angeschlossen - suche Kolonie-Relais (ae2colony_lager) per Funk ...")
+      local ids = {rednet.lookup("ae2colony_colony")}
+      table.sort(ids)
+      if #ids > 1 then print("Mehrere Relais gefunden: "..table.concat(ids, ", ").." - nehme "..ids[1].." (Config: colonyRelayId)") end
+      id = ids[1] or 0
+      if id == 0 then sleep(10) end
+    end
+    print("Kolonie-Relais: Computer "..id)
+    c = relayColony(id)
+    while not pcall(c.isInColony) do
+      print("Kolonie-Relais "..id.." antwortet nicht - neuer Versuch in 20 s")
+      sleep(20)
+    end
+  end
   local ok, inColony = pcall(c.isInColony)
   if not ok or not inColony then error("colony_integrator steht nicht in einer Kolonie") end
   return b, c
@@ -3488,14 +3548,14 @@ end -- eingabe
 -- Start
 -- =====================================================================
 cleanupOldLogs()
-bridge, colony = setupPeripherals()
-views.term = {dev=term.current(), name="term", tab="start", page=1, pages=1}
--- Funk-Modems oeffnen (fuer den Lager-Sender)
+-- Funk-Modems oeffnen (Lager-Sender, Kolonie-Relais, Pocket)
 pcall(function()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" and peripheral.call(name, "isWireless") then rednet.open(name) end
   end
 end)
+bridge, colony = setupPeripherals()
+views.term = {dev=term.current(), name="term", tab="start", page=1, pages=1}
 if cfg.pocketCode == "" then
   math.randomseed(os.epoch("utc"))
   cfg.pocketCode = tostring(math.random(1000, 9999))
